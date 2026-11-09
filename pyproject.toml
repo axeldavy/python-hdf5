@@ -1,0 +1,23 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "Cython>=3.1"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "python-hdf5"
+version = "0.1.0"
+description = "Cython bindings for HDF5 with explicit resource ownership"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+benchmark = ["h5py>=3.12"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["hdf5"]
+install.components = ["python_hdf5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
