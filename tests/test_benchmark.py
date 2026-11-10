@@ -28,7 +28,8 @@ def test_benchmark_all_scenarios(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     report = json.loads(output.read_text(encoding="utf-8"))
-    assert len(report["results"]) == 16
+    assert len(report["results"]) == 17
+    assert "dataset_lookup" in report["results"]
     assert "h5py/new" in result.stdout
     assert report["environment"]["h5py_hdf5"]
     assert report["config"]["threads"] == 2

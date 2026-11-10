@@ -61,6 +61,18 @@ def test_dataset_scalar_empty_and_broadcast(tmp_path: Path) -> None:
             _ = getattr(array, "__getitem__")(np.array([0, 1]))
 
 
+def test_dataset_read_maximum_rank(tmp_path: Path) -> None:
+    """Read the maximum HDF5 rank through whole and selected transfers."""
+    data = np.ones((1,) * 32, dtype="i2")
+    with File(tmp_path / "maximum-rank.h5", "w") as file:
+        dataset = file.create_dataset("value", data=data)
+        dataset.attrs["value"] = data
+        assert dataset.shape == data.shape
+        np.testing.assert_array_equal(dataset[:], data)
+        np.testing.assert_array_equal(dataset[(0,) + (slice(None),) * 31], data[0])
+        np.testing.assert_array_equal(dataset.attrs["value"], data)
+
+
 def test_dataset_paths_errors_and_readonly(tmp_path: Path) -> None:
     """Reject invalid or unsupported operations without modifying datasets."""
     path = tmp_path / "errors.h5"
@@ -94,6 +106,28 @@ def test_dataset_paths_errors_and_readonly(tmp_path: Path) -> None:
         with pytest.raises(OSError):
             dataset.write([3, 4])
         np.testing.assert_array_equal(dataset.read(), [1, 2])
+
+
+def test_dataset_lookup_retains_resolved_parent(tmp_path: Path) -> None:
+    """Keep the correct parent for relative and absolute dataset lookups."""
+    with File(tmp_path / "parents.h5", "w") as file:
+        group = file.create_group("a/b")
+        group.create_dataset("value", data=[4, 5])
+        for owner, path in (
+            (file, "a/b/value"),
+            (group, "value"),
+            (group, "./value"),
+            (group, "/a/b/value"),
+            (group, "/a/./b/value"),
+        ):
+            dataset = owner[path]
+            assert isinstance(dataset, Dataset)
+            assert dataset.parent.name == "/a/b"
+            np.testing.assert_array_equal(dataset[:], [4, 5])
+        with pytest.raises(TypeError):
+            file.create_dataset("a/b/value/child", data=1)
+        with pytest.raises(ValueError):
+            _ = file["a/b/value/"]
 
 
 def test_dataset_require_and_create_like(tmp_path: Path) -> None:

@@ -1,8 +1,5 @@
 #pragma once
 
-#include <atomic>
-#include <shared_mutex>
-#include <unistd.h>
 #include "datatype.hpp"
 #include "group.hpp"
 
@@ -30,14 +27,17 @@ public:
         // Lock the file and open the requested attribute.
         std::unique_lock<std::mutex> lock(group_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
-        if (is_reserved(name)) return Status::NotFound;
-        std::shared_lock<std::shared_mutex> swap_lock(swap_mutex());
+        std::unique_lock<std::mutex> attribute_lock(*group_->file_->attribute_mutex_);
         hid_t object = object_id();
-        htri_t exists = H5Aexists(object, name);
-        if (exists < 0) return failure(error);
-        if (!exists) return Status::NotFound;
         ScopedId attr(H5Aopen(object, name, H5P_DEFAULT), H5Aclose);
-        if (attr.get() < 0) return failure(error);
+        if (attr.get() < 0) {
+            // Distinguish a missing attribute from an HDF5 error without an extra
+            // existence check on successful reads.
+            error = error_message();
+            htri_t exists = H5Aexists(object, name);
+            if (exists < 0) return failure(error);
+            return exists ? Status::Failure : Status::NotFound;
+        }
 
         // Validate the attribute type and dataspace.
         ScopedId type(H5Aget_type(attr.get()), H5Tclose);
@@ -49,18 +49,15 @@ public:
             return Status::Unsupported;
         }
         H5S_class_t space_type = H5Sget_simple_extent_type(space.get());
+        if (space_type == H5S_NO_CLASS) return failure(error);
         if (space_type == H5S_NULL) {
             error = "null attribute dataspaces are not supported";
             return Status::Unsupported;
         }
 
         // Determine the shape and check the transfer size.
-        int rank = H5Sget_simple_extent_ndims(space.get());
-        if (rank < 0) return failure(error);
-        std::vector<hsize_t> dims(static_cast<size_t>(rank));
-        if (rank && H5Sget_simple_extent_dims(space.get(), dims.data(), nullptr) < 0)
-            return failure(error);
-        out.shape.assign(dims.begin(), dims.end());
+        if (Status status = dataspace_shape(space.get(), out.shape, error);
+            status != Status::Ok) return status;
         hssize_t points = H5Sget_simple_extent_npoints(space.get());
         if (points < 0) return failure(error);
 
@@ -73,14 +70,14 @@ public:
         return Status::Ok;
     }
 
-    // Replace an attribute with the supplied data. The new value is written under a
-    // reserved temporary name and renamed over the old one, so a failure keeps the old value.
+    // Replace an attribute with the supplied data; replacement is not atomic.
     // The attribute name is marked UTF-8 when utf8 is set, and ASCII otherwise.
     Status write(const char* name, const AttributeData& input, std::string& error,
               bool utf8 = false) {
         // Validate the type and rank before replacing an existing attribute.
         std::unique_lock<std::mutex> lock(group_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
+        std::unique_lock<std::mutex> attribute_lock(*group_->file_->attribute_mutex_);
         ScopedId type(owned_type(input.dtype), H5Tclose);
         if (type.get() < 0) {
             error = "unsupported attribute datatype";
@@ -104,47 +101,25 @@ public:
         hssize_t points = H5Sget_simple_extent_npoints(space.get());
         if (points < 0) return failure(error);
 
-        // Write the new value under the temporary name, discarding any crash leftover.
-        if (is_reserved(name)) {
-            error = "attribute names starting with '.python-hdf5-' are reserved";
-            return Status::Unsupported;
-        }
+        // Replace the existing attribute and write the supplied data.
         hid_t object = object_id();
         htri_t exists = H5Aexists(object, name);
         if (exists < 0) return failure(error);
-        std::string temporary = temporary_name();
-        {
-            ScopedId attr(H5Acreate2(object, temporary.c_str(), type.get(), space.get(),
-                                     properties.get(), H5P_DEFAULT), H5Aclose);
-            if (attr.get() < 0) return failure(error);
-            Status status = typed_write(type.get(), static_cast<size_t>(points), input, error,
-                                        [&](hid_t memory, const void* buffer) {
-                                            return H5Awrite(attr.get(), memory, buffer);
-                                        });
-            if (status != Status::Ok) {
-                attr.reset(H5I_INVALID_HID);
-                H5Adelete(object, temporary.c_str());
-                return status;
-            }
-        }
-
-        // Swap the new attribute in, excluding readers on other file objects of the same file.
-        std::unique_lock<std::shared_mutex> swap_lock(swap_mutex());
-        if ((exists && H5Adelete(object, name) < 0) ||
-            H5Arename(object, temporary.c_str(), name) < 0) {
-            error = error_message();
-            H5Adelete(object, temporary.c_str());
-            return Status::Failure;
-        }
-        return Status::Ok;
+        if (exists && H5Adelete(object, name) < 0) return failure(error);
+        ScopedId attr(H5Acreate2(object, name, type.get(), space.get(), properties.get(),
+                                 H5P_DEFAULT), H5Aclose);
+        if (attr.get() < 0) return failure(error);
+        return typed_write(type.get(), static_cast<size_t>(points), input, error,
+                           [&](hid_t memory, const void* buffer) {
+                               return H5Awrite(attr.get(), memory, buffer);
+                           });
     }
 
     // Delete a named attribute, returning Status::NotFound when it is absent.
     Status remove(const char* name, std::string& error) {
         std::unique_lock<std::mutex> lock(group_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
-        if (is_reserved(name)) return Status::NotFound;
-        std::shared_lock<std::shared_mutex> swap_lock(swap_mutex());
+        std::unique_lock<std::mutex> attribute_lock(*group_->file_->attribute_mutex_);
         htri_t exists = H5Aexists(object_id(), name);
         if (exists < 0) return failure(error);
         if (!exists) return Status::NotFound;
@@ -156,8 +131,7 @@ public:
     Status contains(const char* name, std::string& error) {
         std::unique_lock<std::mutex> lock(group_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
-        if (is_reserved(name)) return Status::NotFound;
-        std::shared_lock<std::shared_mutex> swap_lock(swap_mutex());
+        std::unique_lock<std::mutex> attribute_lock(*group_->file_->attribute_mutex_);
         htri_t exists = H5Aexists(object_id(), name);
         if (exists < 0) return failure(error);
         return exists ? Status::Ok : Status::NotFound;
@@ -167,6 +141,7 @@ public:
     Status names(std::vector<std::string>& out, std::string& error) {
         std::unique_lock<std::mutex> lock(group_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
+        std::unique_lock<std::mutex> attribute_lock(*group_->file_->attribute_mutex_);
         hsize_t index = 0;
         Collector collector{&out, nullptr};
         herr_t result = H5Aiterate2(object_id(), H5_INDEX_NAME, H5_ITER_INC, &index,
@@ -177,24 +152,6 @@ public:
     }
 
 private:
-    // Return the process-wide mutex making the delete and rename swap invisible to readers.
-    static std::shared_mutex& swap_mutex() {
-        static std::shared_mutex mutex;
-        return mutex;
-    }
-
-    // Return a process-unique reserved name, since several file objects may share one file.
-    static std::string temporary_name() {
-        static std::atomic<unsigned long long> counter{0};
-        return ".python-hdf5-" + std::to_string(static_cast<unsigned long long>(getpid())) +
-               "-" + std::to_string(counter.fetch_add(1));
-    }
-
-    // Return whether name is reserved for internal use.
-    static bool is_reserved(const char* name) {
-        return std::string(name).rfind(".python-hdf5-", 0) == 0;
-    }
-
     struct Collector {
         std::vector<std::string>* names;
         std::exception_ptr exception;
@@ -203,7 +160,7 @@ private:
     static herr_t collect(hid_t, const char* name, const H5A_info_t*, void* data) noexcept {
         auto* collector = static_cast<Collector*>(data);
         try {
-            if (!is_reserved(name)) collector->names->emplace_back(name);
+            collector->names->emplace_back(name);
             return 0;
         } catch (...) {
             collector->exception = std::current_exception();

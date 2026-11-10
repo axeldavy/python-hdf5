@@ -47,6 +47,27 @@ def _run(python: str, code: str, path: Path) -> None:
     subprocess.run([python, "-c", code, str(path)], check=True)
 
 
+def test_nonstandard_numeric_precision_is_rejected(tmp_path: Path, h5py_python: str) -> None:
+    """Reject HDF5 integers that share the size of a standard type but not its precision."""
+    path = tmp_path / "nonstandard.h5"
+    _run(
+        h5py_python,
+        "import h5py, sys\n"
+        "with h5py.File(sys.argv[1], 'w') as f:\n"
+        " t = h5py.h5t.STD_I16LE.copy()\n"
+        " t.set_precision(12)\n"
+        " s = h5py.h5s.create_simple((2,))\n"
+        " h5py.h5d.create(f.id, b'data', t, s).close()\n"
+        " h5py.h5a.create(f.id, b'attribute', t, s).close()\n",
+        path,
+    )
+    with File(path, "r") as file:
+        with pytest.raises(TypeError, match="unsupported"):
+            _ = file.attrs["attribute"]
+        with pytest.raises(TypeError, match="unsupported"):
+            _ = _ds(file, "data")[:]
+
+
 def test_special_dtypes_read_h5py_files(tmp_path: Path, h5py_python: str) -> None:
     """Read every special type written by h5py with matching values and dtypes."""
     path = tmp_path / "h5py.h5"

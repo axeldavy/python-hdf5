@@ -71,37 +71,43 @@ public:
         }
         if (H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr) < 0) return failure(error);
         hid_t location = parent->id_ < 0 ? parent->file_->id_ : parent->id_;
-        htri_t exists = H5Lexists(location, name, H5P_DEFAULT);
-        if (exists < 0) return failure(error);
-        if (create && exists) {
-            error = "a link with this name already exists";
-            return Status::Failure;
-        }
-        if (!create && !exists) return Status::NotFound;
-
         // Open existing hard-linked datasets without following unsupported links.
         if (!create) {
             H5L_info2_t link;
-            if (H5Lget_info2(location, name, &link, H5P_DEFAULT) < 0) return failure(error);
+            if (H5Lget_info2(location, name, &link, H5P_DEFAULT) < 0) {
+                error = error_message();
+                htri_t exists = H5Lexists(location, name, H5P_DEFAULT);
+                if (exists < 0) return failure(error);
+                return exists ? Status::Failure : Status::NotFound;
+            }
             if (link.type != H5L_TYPE_HARD) {
                 error = "soft, external, and user-defined links are not supported";
                 return Status::Unsupported;
             }
-            H5O_info2_t object;
-            if (H5Oget_info_by_name3(location, name, &object, H5O_INFO_BASIC, H5P_DEFAULT) < 0)
-                return failure(error);
-            if (object.type != H5O_TYPE_DATASET) {
-                error = "path does not refer to a dataset";
-                return Status::Unsupported;
-            }
             ScopedId dataset(H5Dopen2(location, name, H5P_DEFAULT), H5Dclose);
-            if (dataset.get() < 0) return failure(error);
+            if (dataset.get() < 0) {
+                error = error_message();
+                H5O_info2_t object;
+                if (H5Oget_info_by_name3(location, name, &object, H5O_INFO_BASIC, H5P_DEFAULT) < 0)
+                    return failure(error);
+                if (object.type != H5O_TYPE_DATASET) {
+                    error = "path does not refer to a dataset";
+                    return Status::Unsupported;
+                }
+                return Status::Failure;
+            }
             output = std::make_shared<DatasetHandle>(parent, dataset.get());
             dataset.release();
             return Status::Ok;
         }
 
         // Validate the type and dimensions before creating the dataset.
+        htri_t exists = H5Lexists(location, name, H5P_DEFAULT);
+        if (exists < 0) return failure(error);
+        if (exists) {
+            error = "a link with this name already exists";
+            return Status::Failure;
+        }
         if (input.shape.size() > H5S_MAX_RANK) {
             error = "dataset rank exceeds HDF5 limit";
             return Status::Unsupported;
@@ -159,18 +165,16 @@ public:
             error = "unsupported dataset datatype";
             return Status::Unsupported;
         }
-        if (H5Sget_simple_extent_type(space.get()) == H5S_NULL) {
+        H5S_class_t space_type = H5Sget_simple_extent_type(space.get());
+        if (space_type == H5S_NO_CLASS) return failure(error);
+        if (space_type == H5S_NULL) {
             error = "null dataset dataspaces are not supported";
             return Status::Unsupported;
         }
 
         // Collect the shape and return early for metadata-only requests.
-        int rank = H5Sget_simple_extent_ndims(space.get());
-        if (rank < 0) return failure(error);
-        std::vector<hsize_t> dims(static_cast<size_t>(rank));
-        if (rank && H5Sget_simple_extent_dims(space.get(), dims.data(), nullptr) < 0)
-            return failure(error);
-        output.shape.assign(dims.begin(), dims.end());
+        if (Status status = dataspace_shape(space.get(), output.shape, error);
+            status != Status::Ok) return status;
         if (!contents) return Status::Ok;
 
         // Check the transfer size and read into owned storage.
@@ -229,18 +233,16 @@ public:
             error = "dataset datatype changed during selection";
             return Status::Unsupported;
         }
-        int rank = H5Sget_simple_extent_ndims(space.get());
-        if (rank < 0) return failure(error);
-        std::vector<hsize_t> dims(static_cast<size_t>(rank));
-        if (rank && H5Sget_simple_extent_dims(space.get(), dims.data(), nullptr) < 0)
-            return failure(error);
-        if (std::vector<std::uint64_t>(dims.begin(), dims.end()) != selection.shape) {
+        std::vector<std::uint64_t> dims;
+        if (Status status = dataspace_shape(space.get(), dims, error);
+            status != Status::Ok) return status;
+        if (dims != selection.shape) {
             error = "dataset shape changed during selection";
             return Status::Unsupported;
         }
 
         // Select file coordinates or an empty selection for zero-length slices.
-        if (rank) {
+        if (!dims.empty()) {
             std::vector<hsize_t> start(selection.start.begin(), selection.start.end());
             std::vector<hsize_t> stride(selection.stride.begin(), selection.stride.end());
             std::vector<hsize_t> count(selection.count.begin(), selection.count.end());

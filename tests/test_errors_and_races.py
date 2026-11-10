@@ -658,8 +658,8 @@ def test_astype_rejects_unsafe_conversions(tmp_path: Path) -> None:
                 dataset.astype(target)[:]
 
 
-def test_attribute_replace_failure_keeps_old_value_and_hides_temporaries(tmp_path: Path) -> None:
-    """Keep the old attribute when replacement fails and never expose temporary names."""
+def test_attribute_replace_validation_failure_keeps_old_value(tmp_path: Path) -> None:
+    """Keep the old attribute when validation fails before replacement."""
     with File(tmp_path / "r.h5", "w") as file:
         file.attrs["a"] = [1, 2, 3]
         with pytest.raises((TypeError, ValueError)):
@@ -667,32 +667,173 @@ def test_attribute_replace_failure_keeps_old_value_and_hides_temporaries(tmp_pat
         assert np.asarray(file.attrs["a"]).tolist() == [1, 2, 3]
         file.attrs["a"] = "new"
         assert file.attrs.keys() == ["a"] and len(file.attrs) == 1
-        assert ".python-hdf5-x" not in file.attrs
-        with pytest.raises(Exception):
-            file.attrs[".python-hdf5-x"] = 1
 
 
-def test_attribute_replace_is_never_observed_missing(tmp_path: Path) -> None:
-    """Readers on a second file object never see the attribute missing during replacement."""
-    path = tmp_path / "w.h5"
-    with File(path, "w") as writer:
-        writer.attrs["a"] = 0
-        with File(path, "r+") as reader:
-            stop = threading.Event()
-            misses: list[int] = []
+@pytest.mark.parametrize("owner", ["file", "group", "dataset"])
+def test_attribute_changes_visible_across_threads_and_file_handles(
+    tmp_path: Path, owner: str
+) -> None:
+    """Observe completed changes without a flush or cached attribute data."""
+    path = tmp_path / "visibility.h5"
+    with File(path, "w") as first:
+        first.create_group("g")
+        first.create_dataset("d", data=[1])
+        with File(path, "r+") as second:
+            if owner == "group":
+                writer, reader = _grp(first, "g").attrs, _grp(second, "g").attrs
+            elif owner == "dataset":
+                writer, reader = _ds(first, "d").attrs, _ds(second, "d").attrs
+            else:
+                writer, reader = first.attrs, second.attrs
+            written = threading.Event()
+            observed = threading.Event()
 
-            def read() -> None:
-                """Read until stopped, recording any miss."""
-                while not stop.is_set():
-                    try:
-                        reader.attrs["a"]
-                    except KeyError:
-                        misses.append(1)
+            def change() -> None:
+                """Replace, then delete, waiting for each observation."""
+                for value in (1, "new", None):
+                    if value is None:
+                        del writer["x"]
+                    else:
+                        writer["x"] = value
+                    written.set()
+                    assert observed.wait(timeout=10)
+                    observed.clear()
 
-            thread = threading.Thread(target=read)
-            thread.start()
-            for index in range(300):
-                writer.attrs["a"] = index
-            stop.set()
-            thread.join()
-        assert not misses
+            def check() -> None:
+                """Read the state after each write has completed."""
+                for value in (1, "new", None):
+                    assert written.wait(timeout=10)
+                    written.clear()
+                    if value is None:
+                        assert "x" not in reader and reader.keys() == [] and len(reader) == 0
+                        with pytest.raises(KeyError):
+                            reader["x"]
+                    else:
+                        assert reader["x"] == value
+                        assert "x" in reader and reader.keys() == ["x"] and len(reader) == 1
+                    observed.set()
+
+            _run_threads(change, check)
+
+
+@pytest.mark.parametrize("owner", ["file", "group", "dataset"])
+@pytest.mark.parametrize("hardlink", [False, True])
+def test_attribute_concurrent_access_across_file_handles(
+    tmp_path: Path, owner: str, hardlink: bool
+) -> None:
+    """Keep concurrent access safe across independently opened file handles."""
+    path = tmp_path / "race-attrs.h5"
+    with File(path, "w"):
+        pass
+    alias = path
+    if hardlink:
+        alias = tmp_path / "alias.h5"
+        try:
+            alias.hardlink_to(path)
+        except OSError as error:
+            pytest.skip(f"Hard links are unavailable: {error}")
+    with File(path, "r+") as first, File(alias, "r+") as second:
+        first.create_group("g")
+        first.create_dataset("d", data=[1])
+        if owner == "group":
+            first_attrs, second_attrs = _grp(first, "g").attrs, _grp(second, "g").attrs
+        elif owner == "dataset":
+            first_attrs, second_attrs = _ds(first, "d").attrs, _ds(second, "d").attrs
+        else:
+            first_attrs, second_attrs = first.attrs, second.attrs
+        first_attrs["x"] = np.ones(8, dtype="i4")
+        stop = threading.Event()
+
+        def writer(file: File, value: int) -> Callable[[], None]:
+            """Return a worker replacing and deleting the shared attribute."""
+
+            def run() -> None:
+                """Write and delete, tolerating a concurrent deletion."""
+                if owner == "group":
+                    attrs = _grp(file, "g").attrs
+                elif owner == "dataset":
+                    attrs = _ds(file, "d").attrs
+                else:
+                    attrs = file.attrs
+                for index in range(_ITERATIONS):
+                    attrs["x"] = np.full(8, value, dtype="i4")
+                    if index % 2:
+                        try:
+                            del attrs["x"]
+                        except KeyError:
+                            pass
+
+            return run
+
+        def reader() -> None:
+            """Exercise read and listing while writes are in progress."""
+            attrs = second_attrs
+            while not stop.is_set():
+                try:
+                    value = np.asarray(attrs["x"])
+                    assert value.shape == (8,) and value.dtype == np.dtype("i4")
+                except KeyError:
+                    pass
+                assert set(attrs.keys()) <= {"x"}
+                assert len(attrs) in (0, 1)
+                _ = "x" in attrs
+
+        def writers() -> None:
+            """Run competing writers and stop the observer even on failure."""
+            try:
+                _run_threads(writer(first, 1), writer(second, 2))
+            finally:
+                stop.set()
+
+        _run_threads(writers, reader)
+        first_attrs["x"] = 42
+        assert second_attrs["x"] == 42
+
+
+@pytest.mark.parametrize("owner", ["file", "group", "dataset"])
+@pytest.mark.parametrize("extra_attributes", [0, 10])
+def test_attribute_delete_while_accessing_another_attribute(
+    tmp_path: Path, owner: str, extra_attributes: int
+) -> None:
+    """Keep distinct attributes intact while another handle deletes and recreates one."""
+    path = tmp_path / "different-attributes.h5"
+    with File(path, "w") as first:
+        first.create_group("g")
+        first.create_dataset("d", data=[1])
+        with File(path, "r+") as second:
+            if owner == "group":
+                changing, stable = _grp(first, "g").attrs, _grp(second, "g").attrs
+            elif owner == "dataset":
+                changing, stable = _ds(first, "d").attrs, _ds(second, "d").attrs
+            else:
+                changing, stable = first.attrs, second.attrs
+
+            changing["a"] = -1
+            stable["z"] = np.zeros(32, dtype="i8")
+            for index in range(extra_attributes):
+                changing[f"middle{index:02}"] = index
+
+            phase = threading.Barrier(2)
+
+            def replace_other() -> None:
+                """Delete and recreate the attribute that sorts before the stable one."""
+                for index in range(_ITERATIONS):
+                    phase.wait(timeout=10)
+                    del changing["a"]
+                    changing["a"] = -index - 1
+                    phase.wait(timeout=10)
+
+            def update_stable() -> None:
+                """Check each stable-attribute write and read during the churn."""
+                for index in range(_ITERATIONS):
+                    phase.wait(timeout=10)
+                    expected = np.full(32, index + 1, dtype="i8")
+                    stable["z"] = expected
+                    np.testing.assert_array_equal(stable["z"], expected)
+                    phase.wait(timeout=10)
+
+            _run_threads(replace_other, update_stable)
+            assert changing["a"] == -_ITERATIONS
+            np.testing.assert_array_equal(changing["z"], np.full(32, _ITERATIONS, dtype="i8"))
+            for index in range(extra_attributes):
+                assert stable[f"middle{index:02}"] == index

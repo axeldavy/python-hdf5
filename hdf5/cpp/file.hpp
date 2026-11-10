@@ -2,6 +2,7 @@
 
 #include <hdf5.h>
 
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -164,6 +165,17 @@ public:
             }
             return Status::Failure;
         }
+        unsigned long file_number;
+        if (H5Fget_fileno(id_, &file_number) < 0) {
+            error = error_message();
+            if (H5Fclose(id_) >= 0) {
+                id_ = H5I_INVALID_HID;
+            } else {
+                std::fputs("python-hdf5: failed to close file after identity failure\n", stderr);
+            }
+            return Status::Failure;
+        }
+        attribute_mutex_ = &attribute_mutex(file_number);
         filename_ = path;
         return Status::Ok;
     }
@@ -210,7 +222,14 @@ private:
     friend class GroupHandle;
     friend class AttributeHandle;
     friend class DatasetHandle;
+    // Share an attribute lock across all handles for an HDF5 file number.
+    static std::mutex& attribute_mutex(unsigned long file_number) {
+        static std::array<std::mutex, 97> mutexes;
+        return mutexes[file_number % mutexes.size()];
+    }
+
     std::mutex mutex_;
+    std::mutex* attribute_mutex_ = nullptr;
     hid_t id_ = H5I_INVALID_HID;
     std::string filename_;
 };

@@ -58,6 +58,24 @@ def test_attribute_mapping_and_empty_arrays(tmp_path: Path) -> None:
             del attrs["a"]
 
 
+@pytest.mark.parametrize("owner", ["file", "group", "dataset"])
+def test_attribute_read_missing_and_invalid_names(tmp_path: Path, owner: str) -> None:
+    """Distinguish missing attributes from invalid names and preserve later reads."""
+    with File(tmp_path / "read-errors.h5", "w") as file:
+        group = file.create_group("group")
+        dataset = file.create_dataset("dataset", data=[1])
+        attrs = {"file": file, "group": group, "dataset": dataset}[owner].attrs
+        attrs["present"] = 42
+
+        for name in ("missing", b"missing"):
+            with pytest.raises(KeyError) as error:
+                _ = attrs[name]
+            assert error.value.args == (name,)
+        with pytest.raises(OSError, match="attribute name"):
+            _ = attrs[""]
+        assert attrs["present"] == 42
+
+
 def test_attribute_unsupported_and_readonly(tmp_path: Path) -> None:
     """Reject unsupported values without replacing an existing attribute."""
     path = tmp_path / "unsupported.h5"
@@ -146,6 +164,7 @@ def test_attribute_h5py_interoperability(tmp_path: Path, h5py_python: str) -> No
         " f.attrs['be'] = np.array([1, 7], dtype='>i4')\n"
         " f.attrs['truth'] = np.array([True, False])\n"
         " f.attrs['text'] = 'unsupported'\n"
+        " f.attrs['.python-hdf5-existing'] = 17\n"
         " f.attrs.create('null', h5py.Empty('f'))\n"
         " f.attrs.create('enum', np.array([1], dtype=h5py.enum_dtype({'ONE': 1}, 'i1')))\n"
         " f.create_group('group').attrs['scalar'] = np.float32(1.5)\n"
@@ -158,6 +177,11 @@ def test_attribute_h5py_interoperability(tmp_path: Path, h5py_python: str) -> No
         assert file.attrs["truth"].dtype == np.dtype("bool")
         assert file["group"].attrs["scalar"] == np.float32(1.5)
         assert file.attrs["text"] == "unsupported"
+        assert ".python-hdf5-existing" in file.attrs
+        assert ".python-hdf5-existing" in file.attrs.keys()
+        assert file.attrs[".python-hdf5-existing"] == 17
+        file.attrs[".python-hdf5-new"] = 19
+        del file.attrs[".python-hdf5-existing"]
         with pytest.raises(TypeError, match="null"):
             _ = file.attrs["null"]
         enum = file.attrs["enum"]
@@ -172,5 +196,7 @@ def test_attribute_h5py_interoperability(tmp_path: Path, h5py_python: str) -> No
         " assert f['group'].attrs['bool'].dtype == np.dtype('bool')\n"
         " assert f['group'].attrs['bool'].tolist() == [True, False]\n"
         " assert f.attrs['text'] == 'unsupported'\n"
+        " assert f.attrs['.python-hdf5-new'] == 19\n"
+        " assert '.python-hdf5-existing' not in f.attrs\n"
     )
     subprocess.run([h5py_python, "-c", check, str(path)], check=True)

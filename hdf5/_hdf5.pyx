@@ -587,9 +587,11 @@ cdef void _normalize_selection(object selection, tuple shape, object dtype,
 cdef class AttributeManager:
     """Access numeric and string HDF5 attributes on a file, group, or dataset.
 
-    The manager shares its owner's lifetime and synchronization. Attribute
-    replacement is not atomic; an HDF5 error after deletion can lose the old
-    value. Values are copied when reading or writing.
+    The manager shares its owner's lifetime and synchronization. No attribute
+    data is cached. Attribute operations through this library are synchronized
+    across file handles in the same process, but callers should synchronize
+    sequences of operations. Replacement is not transactional: an HDF5 error
+    after deletion can lose the old value. Reads return independent values.
     """
 
     cdef shared_ptr[AttributeHandle] _handle
@@ -639,7 +641,7 @@ cdef class AttributeManager:
         return _unpack_array(result, True)
 
     def __setitem__(self, name, value):
-        """Create or replace a numeric or string attribute from a copied value."""
+        """Create or replace a numeric or string attribute."""
         # Validate the owner and attribute name.
         if not self._handle:
             raise ValueError("attribute manager is not initialized")
@@ -647,11 +649,11 @@ cdef class AttributeManager:
         if not encoded:
             raise ValueError("attribute name must not be empty")
 
-        # Prepare independent C-order data and its HDF5 dimensions.
+        # Prepare C-order data and its HDF5 dimensions.
         cdef AttributeData input
         keep = _pack_array(_prepare_array(value, "attribute"), input)
 
-        # Write from the native-owned copy.
+        # Keep the source alive until the native write completes.
         cdef const char* name_ptr = encoded
         cdef bint utf8 = _needs_utf8(name)
         cdef string error
@@ -1152,7 +1154,8 @@ cdef class Group:
         group._group = handle
         return group
 
-    cdef object _dataset_at(self, object name, bint create, object value, object dtype):
+    cdef object _dataset_at(self, object name, bint create, object value, object dtype,
+                            shared_ptr[GroupHandle] parent):
         """Open or create a dataset under a safely resolved parent group."""
         # Validate the path and locate its parent.
         cdef bytes encoded = _encode_name(name)
@@ -1164,9 +1167,13 @@ cdef class Group:
             parent_path = b"/" + parent_path
         if not parent_path:
             parent_path = b"."
-        cdef shared_ptr[GroupHandle] parent
-        if self._resolve(parent_path, False, False, parent) == Status.NotFound:
-            raise KeyError(name)
+        cdef Status parent_status
+        if not parent:
+            parent_status = self._resolve(parent_path, False, False, parent)
+            if parent_status == Status.NotFound:
+                raise KeyError(name)
+            if parent_status == Status.IsDataset:
+                raise TypeError("dataset parent is not a group")
         if not parent:
             raise TypeError("dataset parent is not a group")
 
@@ -1216,7 +1223,8 @@ cdef class Group:
             TypeError: If the datatype, parent, or link is unsupported.
             OSError: If the dataset cannot be created or written.
         """
-        return self._dataset_at(name, True, data, dtype)
+        cdef shared_ptr[GroupHandle] parent
+        return self._dataset_at(name, True, data, dtype, parent)
 
     def require_dataset(self, name, *, data, dtype=None):
         """Return a compatible dataset or create it from data.
@@ -1413,7 +1421,7 @@ cdef class Group:
         if result == Status.NotFound:
             raise KeyError(name)
         if result == Status.IsDataset:
-            return self._dataset_at(name, False, None, None)
+            return self._dataset_at(name, False, None, None, handle)
         cdef Group group = Group.__new__(Group)
         group._group = handle
         return group

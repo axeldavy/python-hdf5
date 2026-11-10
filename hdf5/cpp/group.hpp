@@ -77,18 +77,32 @@ public:
         for (size_t index = 0; index < components.size(); ++index) {
             const std::string& part = components[index];
             const bool last = index + 1 == components.size();
-            htri_t exists = H5Lexists(current, part.c_str(), H5P_DEFAULT);
-            if (exists < 0) {
-                error = error_message();
-                return Status::Failure;
-            }
-            if (!exists && !create) return Status::NotFound;
-            if (exists) {
-                H5L_info2_t info;
-                if (H5Lget_info2(current, part.c_str(), &info, H5P_DEFAULT) < 0) {
+            H5L_info2_t info;
+            htri_t exists;
+            if (!create) {
+                if (H5Lget_info2(current, part.c_str(), &info, H5P_DEFAULT) >= 0) {
+                    exists = 1;
+                } else {
+                    error = error_message();
+                    exists = H5Lexists(current, part.c_str(), H5P_DEFAULT);
+                    if (exists < 0) {
+                        error = error_message();
+                        return Status::Failure;
+                    }
+                    return exists ? Status::Failure : Status::NotFound;
+                }
+            } else {
+                exists = H5Lexists(current, part.c_str(), H5P_DEFAULT);
+                if (exists < 0) {
                     error = error_message();
                     return Status::Failure;
                 }
+                if (exists && H5Lget_info2(current, part.c_str(), &info, H5P_DEFAULT) < 0) {
+                    error = error_message();
+                    return Status::Failure;
+                }
+            }
+            if (exists) {
                 if (info.type != H5L_TYPE_HARD) {
                     error = "soft, external, and user-defined links are not supported";
                     return Status::Unsupported;
@@ -106,7 +120,22 @@ public:
                 }
                 if (object.type != H5O_TYPE_GROUP) {
                     if (membership) return Status::NotFound;
-                    if (last && !create && object.type == H5O_TYPE_DATASET) return Status::IsDataset;
+                    if (last && !create && object.type == H5O_TYPE_DATASET) {
+                        // Retain the already resolved parent for the dataset open.
+                        if (!opened.empty()) {
+                            output = std::make_shared<GroupHandle>(file_, opened.back()->get());
+                            opened.back()->release();
+                        } else {
+                            ScopedId parent(H5Gopen2(current, ".", H5P_DEFAULT), H5Gclose);
+                            if (parent.get() < 0) {
+                                error = error_message();
+                                return Status::Failure;
+                            }
+                            output = std::make_shared<GroupHandle>(file_, parent.get());
+                            parent.release();
+                        }
+                        return Status::IsDataset;
+                    }
                     error = "path refers to an object that is not a group";
                     return Status::Unsupported;
                 }

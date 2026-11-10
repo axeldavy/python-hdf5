@@ -54,6 +54,23 @@ struct AttributeData {
     }
 };
 
+// Retrieve the rank and dimensions in one call; null dataspaces are checked by the caller.
+inline Status dataspace_shape(hid_t space, std::vector<std::uint64_t>& shape,
+                             std::string& error) {
+    hsize_t dims[H5S_MAX_RANK];
+    int rank = H5Sget_simple_extent_dims(space, dims, nullptr);
+    if (rank < 0) {
+        error = error_message();
+        return Status::Failure;
+    }
+    if (rank > H5S_MAX_RANK) {
+        error = "dataspace rank exceeds HDF5 limit";
+        return Status::Unsupported;
+    }
+    shape.assign(dims, dims + rank);
+    return Status::Ok;
+}
+
 // Numeric and boolean types
 
 // Map a NumPy numeric dtype string to a borrowed predefined HDF5 numeric type.
@@ -101,17 +118,28 @@ inline hid_t boolean_type() {
 
 // Return the numeric dtype string of an integer or float type, or an empty string.
 inline std::string numeric_dtype(hid_t type) {
-    // Compare exact HDF5 types to retain their byte order.
-    static const char* names[] = {
-        "|i1", "|u1", "<i2", ">i2", "<u2", ">u2", "<i4", ">i4", "<u4", ">u4",
-        "<i8", ">i8", "<u8", ">u8", "<f2", ">f2", "<f4", ">f4", "<f8", ">f8",
-    };
-    for (const char* name : names) {
-        htri_t equal = H5Tequal(type, numeric_type(name));
-        if (equal < 0) return {};
-        if (equal) return name;
+    H5T_class_t kind = H5Tget_class(type);
+    if (kind != H5T_INTEGER && kind != H5T_FLOAT) return {};
+    size_t size = H5Tget_size(type);
+    if (size != 1 && size != 2 && size != 4 && size != 8) return {};
+    if (kind == H5T_FLOAT && size == 1) return {};
+
+    char code = 'f';
+    if (kind == H5T_INTEGER) {
+        H5T_sign_t sign = H5Tget_sign(type);
+        if (sign == H5T_SGN_2) code = 'i';
+        else if (sign == H5T_SGN_NONE) code = 'u';
+        else return {};
     }
-    return {};
+    char order = '|';
+    if (size > 1) {
+        H5T_order_t byte_order = H5Tget_order(type);
+        if (byte_order == H5T_ORDER_LE) order = '<';
+        else if (byte_order == H5T_ORDER_BE) order = '>';
+        else return {};
+    }
+    std::string name{order, code, static_cast<char>('0' + size)};
+    return H5Tequal(type, numeric_type(name)) > 0 ? name : std::string();
 }
 
 // Return the item size in bytes encoded in a numeric dtype string such as "<i4".
@@ -515,15 +543,21 @@ private:
 // Build the memory type and validate the element size for a transfer of points elements.
 // Return Ok, or Unsupported with error filled when the type is unsupported or too large.
 inline Status transfer_type(const std::string& name, hid_t file_type, size_t points,
-                         ScopedId& memory, size_t& item_size, std::string& error) {
-    memory.reset(memory_type(name, file_type));
-    if (memory.get() < 0) {
+                            ScopedId& memory, hid_t& memory_id, size_t& item_size,
+                            std::string& error, bool borrow_file_type = false) {
+    if (borrow_file_type && !is_vlen_string_name(name) && !is_fixed_string_name(name)) {
+        memory_id = file_type;
+    } else {
+        memory.reset(memory_type(name, file_type));
+        memory_id = memory.get();
+    }
+    if (memory_id < 0) {
         error = "unsupported datatype";
         return Status::Unsupported;
     }
     if (is_vlen_string_name(name)) item_size = sizeof(char*);
     else if (is_vlen_array_name(name)) item_size = sizeof(hvl_t);
-    else item_size = H5Tget_size(memory.get());
+    else item_size = H5Tget_size(memory_id);
     if (!item_size || points > std::numeric_limits<size_t>::max() / item_size) {
         error = "transfer is too large";
         return Status::Unsupported;
@@ -538,10 +572,12 @@ template <class Io>
 inline Status typed_read(hid_t file_type, hid_t space, size_t points, AttributeData& out,
                       std::string& error, Io io) {
     // Build the memory type from the stored type.
-    std::string name = dtype_name(file_type);
+    const std::string& name = out.dtype;
     ScopedId memory(H5I_INVALID_HID, H5Tclose);
+    hid_t memory_id = H5I_INVALID_HID;
     size_t item_size = 0;
-    if (Status status = transfer_type(name, file_type, points, memory, item_size, error);
+    if (Status status = transfer_type(name, file_type, points, memory, memory_id, item_size, error,
+                                      true);
         status != Status::Ok)
         return status;
 
@@ -556,7 +592,7 @@ inline Status typed_read(hid_t file_type, hid_t space, size_t points, AttributeD
             out.block_size = size;
             target = out.block.get();
         }
-        if (io(memory.get(), target) < 0) {
+        if (io(memory_id, target) < 0) {
             error = error_message();
             return Status::Failure;
         }
@@ -568,9 +604,9 @@ inline Status typed_read(hid_t file_type, hid_t space, size_t points, AttributeD
     out.strings.reserve(points);
     if (is_vlen_string_name(name)) {
         VlenBuffer<char*> buffer(points);
-        if (points) buffer.arm(memory.get(), space);
+        if (points) buffer.arm(memory_id, space);
         char* empty_buffer = nullptr;
-        if (io(memory.get(), points ? static_cast<void*>(buffer.data())
+        if (io(memory_id, points ? static_cast<void*>(buffer.data())
                                     : static_cast<void*>(&empty_buffer)) < 0) {
             error = error_message();
             return Status::Failure;
@@ -583,9 +619,9 @@ inline Status typed_read(hid_t file_type, hid_t space, size_t points, AttributeD
     // Read variable-length numeric arrays as raw bytes per element.
     const size_t base_size = numeric_item_size(name.substr(5));
     VlenBuffer<hvl_t> buffer(points);
-    if (points) buffer.arm(memory.get(), space);
+    if (points) buffer.arm(memory_id, space);
     hvl_t empty_buffer{0, nullptr};
-    if (io(memory.get(), points ? static_cast<void*>(buffer.data())
+    if (io(memory_id, points ? static_cast<void*>(buffer.data())
                                 : static_cast<void*>(&empty_buffer)) < 0) {
         error = error_message();
         return Status::Failure;
@@ -607,9 +643,10 @@ inline Status typed_write(hid_t file_type, size_t points, const AttributeData& i
                        std::string& error, Io io) {
     // Build the memory type from the supplied data.
     ScopedId memory(H5I_INVALID_HID, H5Tclose);
+    hid_t memory_id = H5I_INVALID_HID;
     size_t item_size = 0;
     if (Status status =
-            transfer_type(input.dtype, file_type, points, memory, item_size, error);
+            transfer_type(input.dtype, file_type, points, memory, memory_id, item_size, error);
         status != Status::Ok)
         return status;
 

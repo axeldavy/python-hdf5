@@ -74,14 +74,18 @@ Scalar reads return NumPy scalars; array reads return independent arrays. Byte
 order and zero-length dimensions are preserved. Compound, array and reference
 types and null dataspaces are not yet supported. Dtype metadata that cannot be
 stored is rejected with `TypeError` rather than dropped.
-Inputs are copied before writing, except that dataset writes of a C-contiguous
-array that already has the dataset dtype and shape are read in place; callers must
-not mutate an input concurrently with the call. Attribute replacement writes the new value under a
-reserved `.python-hdf5-*` name and renames it over the old one, so a failure keeps the old value and
-readers in the process never see the attribute missing. A crash mid-replacement can leave a hidden
-`.python-hdf5-*` attribute in the file; it is never listed or readable. Names with that prefix are
-reserved. `astype` converts numeric to numeric and text to text only; other conversions raise
-`TypeError`. `"a/b" in file` is `False` when `a` is a dataset.
+Callers must not mutate input arrays concurrently with a write. Attribute managers do not cache
+values or names: a completed change is visible to subsequent operations on other managers of the
+same object, including through another file handle in the same process. Attribute operations
+through this library are serialized across handles for the same HDF5 file, to guard against unsafe
+concurrent deletion and access. Callers should still synchronize sequences of operations on the
+same attribute: for example, a membership check followed by a read is not atomic. Replacement
+deletes the old attribute before creating and writing the new one; it is not transactional, and
+an HDF5 failure after deletion can leave the old value lost or the new value incomplete. HDF5
+file locking and its cross-process access rules apply; file locking does not provide transactional
+replacement.
+`astype` converts numeric to numeric and text to text only; other conversions raise `TypeError`.
+`"a/b" in file` is `False` when `a` is a dataset.
 Attribute managers retain their group and file until released, and are
 invalidated when the file is explicitly closed.
 
@@ -149,7 +153,7 @@ values by bytes; strings are never parsed as numbers.
 | Files | Modes `r`, `r+`, `w`, `w-`, `x`, `a`; `flush`, `close`, context manager; thread-safe per-file locking | Driver options, file-locking and libver options, in-memory files, user blocks |
 | Groups | Create (with intermediate groups), lookup, membership, `keys`, iteration, `len`; absolute and relative paths | Soft, external and user-defined links (listed, not traversed), `..` paths, deleting or moving links, `visit`/`walk`, creation properties |
 | Datasets | Create from data (optional `dtype=`), `shape`, `dtype`, `read`/`write`, positive-step slices, integers, tuples, ellipsis, `asstr`, `astype`, `len` | Creating empty datasets from `shape=` alone, chunking, compression and other filters on create, resize, fill values, negative or zero steps, fancy or boolean indexing, new axes, null dataspaces, region and virtual datasets |
-| Attributes | Read, write, delete, membership, iteration, `keys`, `len` on files, groups and datasets | Null dataspaces, `create` with explicit dtype or shape |
+| Attributes | Read, write, delete, membership, iteration, `keys`, `len` on files, groups and datasets | Atomic replacement, null dataspaces, `create` with explicit dtype or shape |
 | Numeric types | 8/16/32/64-bit signed and unsigned integers, float16/32/64, complex64/128, bool, either byte order | 128-bit and extended floats, bit fields |
 | Strings | Variable-length and fixed-length, UTF-8 and ASCII, h5py-compatible reads and writes | Fixed-width `U` arrays, mixed `str`/`bytes` arrays, embedded null bytes |
 | Special types | Enums, opaque (including tagged `datetime64`/`timedelta64`), variable-length integer and float arrays | Compound, array, object and region references, time types, bitfields |
@@ -192,10 +196,13 @@ so writes do not measure durable storage. h5py and this library may bundle
 different HDF5 versions and build options; compare results only with their
 reported environment and configuration.
 
-The extension statically bundles HDF5 2.2.0, built with thread safety enabled.
+The extension bundles HDF5 2.2.0, built with thread safety enabled: it is
+statically linked on Linux and macOS and shipped as a private DLL alongside the
+extension on Windows, where HDF5 does not support static thread-safe builds.
 Building from source requires a C and C++ compiler, CMake, and network access to
 download the pinned HDF5 source. The build verifies its SHA-256 checksum. The
-bundled HDF5 symbols are hidden to reduce conflicts with other extensions. HDF5
+statically linked HDF5 symbols are hidden, and the Windows DLL has a unique
+name, to reduce conflicts with other extensions. HDF5
 file locks and cross-process access rules still apply. The initial build does
 not include compression filters. HDF5 license notices are installed under
 `hdf5/licenses`.

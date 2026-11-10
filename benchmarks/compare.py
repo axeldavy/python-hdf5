@@ -33,6 +33,7 @@ _MIB: Final[int] = 1024 * 1024
 _SCENARIOS: Final[tuple[str, ...]] = (
     "file_open_close",
     "group_lookup",
+    "dataset_lookup",
     "group_list",
     "group_create",
     "attribute_read",
@@ -193,6 +194,13 @@ class _BenchFile:
                 """Verify the resolved group contains the expected children."""
                 if len(file["tree/branch"]) != 32:
                     raise AssertionError("group lookup returned incorrect children")
+        elif name == "dataset_lookup":
+            def operation() -> None:
+                """Resolve an existing dataset."""
+                file["small"]
+            def verify() -> None:
+                """Verify the resolved dataset has the expected contents."""
+                np.testing.assert_array_equal(file["small"][:], small)
         elif name == "group_list":
             def operation() -> None:
                 """List existing group links."""
