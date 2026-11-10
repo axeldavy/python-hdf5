@@ -50,6 +50,36 @@ flushing a closed file raises `ValueError`. Use a context manager or `close()`
 to report close errors. Native cleanup is a fallback and reports failures to
 standard error.
 
+### File-access options
+
+Optional keyword arguments preserve the HDF5 defaults when omitted:
+
+- `driver="core"` loads the named file into memory. `backing_store=True` (the
+  default) writes changes to the named disk file on flush or close;
+  `backing_store=False` discards changes instead. `block_size` sets the core
+  driver's allocation increment in bytes (default 65536). These two options
+  require the core driver. A filename is still required; opening a byte image
+  or a Python file-like object is not supported.
+- `rdcc_nslots`, `rdcc_nbytes`, and `rdcc_w0` configure the raw chunk cache
+  defaults for each dataset. The first two are nonnegative integers; the
+  preemption weight is between 0 and 1. Omitted values retain HDF5 defaults.
+  These settings affect chunked datasets, not the metadata cache.
+- `libver` sets HDF5 format bounds as a minimum string or a `(minimum, maximum)`
+  tuple. Supported values are `"earliest"`, `"v108"`, `"v110"`, `"v112"`,
+  `"v114"`, `"v200"`, and `"latest"`. A single value uses `"latest"` as
+  the maximum. Newer formats may not be readable by older HDF5 libraries.
+- `locking` accepts `True`/`"true"`, `False`/`"false"`, or `"best-effort"`.
+  Best-effort still locks when available but tolerates filesystems without
+  locking support. The `HDF5_USE_FILE_LOCKING` environment variable can override
+  this setting. Disabling locks does not make concurrent process access safe:
+  follow HDF5's access rules or risk corruption.
+
+```python
+with File("scratch.h5", "w", driver="core", backing_store=False,
+          rdcc_nbytes=4 * 1024 * 1024, libver="latest") as file:
+    file.create_dataset("values", data=[1, 2, 3])
+```
+
 `File` and `Group` provide `create_group`, `require_group`, path lookup,
 membership, `keys`, `items`, `values`, `get`, iteration and `len`. These
 collection methods return snapshots, with `items()` returning `(name, object)`
@@ -74,6 +104,10 @@ Scalar reads return NumPy scalars; array reads return independent arrays. Byte
 order and zero-length dimensions are preserved. Compound, array and reference
 types and null dataspaces are not yet supported. Dtype metadata that cannot be
 stored is rejected with `TypeError` rather than dropped.
+`attrs.create(name, data, shape=None, dtype=None)` creates or replaces an attribute
+with an explicit dtype and/or shape. A supplied shape must have the same number
+of elements as the data; this operation reshapes rather than broadcasts. Supported
+special dtypes retain their HDF5 metadata.
 Dataset datatype descriptions are cached per open dataset handle because an HDF5 dataset's
 datatype is immutable; its dataspace and data are not cached. Selected reads use the current
 dataspace, and writes revalidate the shape after preparing the input.
@@ -92,11 +126,18 @@ replacement.
 Attribute managers retain their group and file until released, and are
 invalidated when the file is explicitly closed.
 
-`create_dataset(name, data=...)` creates a dataset in an existing parent group;
+`create_dataset(name, data=...)` or `create_dataset(name, shape=..., dtype=...)`
+creates a dataset in an existing parent group;
 unlike `create_group`, it does not create missing intermediate groups.
-`require_dataset(name, data=...)` creates a missing dataset or returns an
-existing one with the same shape if the data can be converted to its dtype;
-when `dtype` is supplied, the existing dtype must match it exactly.
+Chunked creation supports `chunks`, `maxshape` (with `None` for unlimited axes),
+`compression="gzip"` and compression levels, `shuffle`, `fletcher32`, and scalar
+`fillvalue` for fixed-size types. Chunking is selected automatically when needed.
+Chunked datasets can be extended or shrunk with `dataset.resize(shape)` or
+`dataset.resize(size, axis=...)`. Data beyond a shrunk extent is discarded.
+`require_dataset(name, shape, dtype, exact=False)` returns a same-shape dataset
+whose dtype can safely accept the requested dtype, or creates one. The existing
+`require_dataset(name, data=..., dtype=...)` form remains available and requires
+an exact dtype match when a dtype is specified.
 `create_dataset_like(name, source)` copies a dataset's data and dtype, with an
 optional dtype override. Dataset
 `shape` and `dtype` describe the stored values. `read()` and `write(value)`,
@@ -112,6 +153,18 @@ dataset. The supported types
 match attribute types above. Compound, array, reference and other datatypes, null
 dataspaces, and datasets requiring unavailable compression filters are not yet
 supported. Writes are not transactional.
+
+### SWMR access
+
+Create objects first in a file opened with `libver="latest"`, then set
+`file.swmr_mode = True` to start the single writer. Publish changes with
+`dataset.flush()` (or `file.flush()`). Readers in other processes open with
+`File(path, "r", swmr=True)` and call `dataset.refresh()` before observing
+new data and shapes. Coordinate reader/writer notifications separately; flush
+does not notify readers. Follow HDF5 SWMR restrictions, including creating the
+necessary objects before entering writer mode and using a filesystem with the
+required POSIX I/O semantics. SWMR is not a multi-writer protocol or a
+transaction/durability guarantee.
 
 ### Special types and names
 
@@ -153,16 +206,17 @@ values by bytes; strings are never parsed as numbers.
 
 | Area | Supported | Not supported yet |
 |---|---|---|
-| Files | Modes `r`, `r+`, `w`, `w-`, `x`, `a`; `flush`, `close`, context manager; thread-safe per-file locking | Driver options, file-locking and libver options, in-memory files, user blocks |
+| Files | Modes `r`, `r+`, `w`, `w-`, `x`, `a`; `flush`, `close`, context manager; core in-memory driver; raw chunk cache, libver and file-locking options; thread-safe per-file locking | Other drivers, file images and file-like objects, metadata cache configuration, user blocks |
 | Groups | Create (with intermediate groups), lookup, membership, `keys`, iteration, `len`; absolute and relative paths | Soft, external and user-defined links (listed, not traversed), `..` paths, deleting or moving links, `visit`/`walk`, creation properties |
-| Datasets | Create from data (optional `dtype=`), `shape`, `dtype`, `read`/`write`, positive-step slices, integers, tuples, ellipsis, `asstr`, `astype`, `len` | Creating empty datasets from `shape=` alone, chunking, compression and other filters on create, resize, fill values, negative or zero steps, fancy or boolean indexing, new axes, null dataspaces, region and virtual datasets |
-| Attributes | Read, write, delete, membership, iteration, `keys`, `len` on files, groups and datasets | Atomic replacement, null dataspaces, `create` with explicit dtype or shape |
+| Datasets | Create from data or shape and dtype; chunking, gzip, shuffle, Fletcher32, fixed-size fill values, resize; `shape`, `dtype`, `read`/`write`, positive-step slices, integers, tuples, ellipsis, `asstr`, `astype`, `len` | Variable-length fill values, other compression filters, creation-property introspection, negative or zero steps, fancy or boolean indexing, new axes, null dataspaces, region and virtual datasets |
+| Attributes | Read, write, explicit `create` with dtype and shape, delete, membership, iteration, `keys`, `len` on files, groups and datasets | Atomic replacement, null dataspaces |
 | Numeric types | 8/16/32/64-bit signed and unsigned integers, float16/32/64, complex64/128, bool, either byte order | 128-bit and extended floats, bit fields |
 | Strings | Variable-length and fixed-length, UTF-8 and ASCII, h5py-compatible reads and writes | Fixed-width `U` arrays, mixed `str`/`bytes` arrays, embedded null bytes |
 | Special types | Enums, opaque (including tagged `datetime64`/`timedelta64`), variable-length integer and float arrays | Compound, array, object and region references, time types, bitfields |
 | Names | `str` as UTF-8, `bytes` unchanged, character set flags like h5py | Names containing null bytes |
 | Convenience API | `keys`, `items`, `values`, `get`, `name`, `parent`, `file`, `require_group`, `require_dataset`, `create_dataset_like`, iteration, `len`, `in`, `[]`, `del group[name]` | |
-| Not implemented | | Dimension scales, SWMR, parallel HDF5, Python-level `Dataset.fields`/`dims`, h5py's low-level `h5py.h5*` API |
+| SWMR | Reader open, writer activation, dataset flush and refresh | Multi-writer access, process notifications |
+| Not implemented | | Dimension scales, parallel HDF5, Python-level `Dataset.fields`/`dims`, h5py's low-level `h5py.h5*` API |
 
 Interoperability tests use h5py when it is available. To use h5py from a
 different interpreter, run `HDF5_TEST_H5PY_PYTHON=/path/to/python pytest`.
@@ -207,7 +261,7 @@ download the pinned HDF5 source. The build verifies its SHA-256 checksum. The
 statically linked HDF5 symbols are hidden, and the Windows DLL has a unique
 name, to reduce conflicts with other extensions. HDF5
 file locks and cross-process access rules still apply. The initial build does
-not include compression filters. HDF5 license notices are installed under
+includes gzip/deflate using zlib; building requires zlib development files. HDF5 license notices are installed under
 `hdf5/licenses`.
 
 HDF5 operations may serialize internally even when called from different

@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterator
 from os import PathLike
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 from types import EllipsisType, TracebackType
 
 import numpy as np
@@ -11,6 +11,10 @@ import numpy.typing as npt
 class AttributeManager:
     """Access numeric and string attributes on a file, group, or dataset."""
 
+    def create(
+        self, name: str | bytes, data: npt.ArrayLike, shape: int | tuple[int, ...] | None = None,
+        dtype: npt.DTypeLike | None = None,
+    ) -> None: ...
     def keys(self) -> list[str | bytes]: ...
     def __getitem__(self, name: str | bytes) -> np.generic | npt.NDArray: ...
     def __setitem__(self, name: str | bytes, value: npt.ArrayLike) -> None: ...
@@ -65,6 +69,9 @@ class Dataset:
     def asstr(self, encoding: str | None = None, errors: str = "strict") -> _ReadAdapter: ...
     def astype(self, dtype: npt.DTypeLike) -> _ReadAdapter: ...
     def read(self) -> np.generic | npt.NDArray: ...
+    def flush(self) -> None: ...
+    def refresh(self) -> None: ...
+    def resize(self, size: int | tuple[int, ...], axis: int | None = None) -> None: ...
     def write(self, value: npt.ArrayLike) -> None: ...
     def __getitem__(
         self, selection: int | slice | EllipsisType | tuple[int | slice | EllipsisType, ...]
@@ -88,10 +95,17 @@ class Group:
     def create_group(self, name: str | bytes) -> Group: ...
     def require_group(self, name: str | bytes) -> Group: ...
     def create_dataset(
-        self, name: str | bytes, *, data: npt.ArrayLike, dtype: npt.DTypeLike | None = None
+        self, name: str | bytes, shape: int | tuple[int, ...] | None = None,
+        dtype: npt.DTypeLike | None = None, data: npt.ArrayLike | None = None, *,
+        chunks: bool | tuple[int, ...] | None = None,
+        maxshape: int | tuple[int | None, ...] | None = None,
+        compression: Literal["gzip"] | None = None, compression_opts: int | None = None,
+        shuffle: bool = False, fletcher32: bool = False, fillvalue: object = None,
     ) -> Dataset: ...
     def require_dataset(
-        self, name: str | bytes, *, data: npt.ArrayLike, dtype: npt.DTypeLike | None = None
+        self, name: str | bytes, shape: int | tuple[int, ...] | None = None,
+        dtype: npt.DTypeLike | None = None, *, data: npt.ArrayLike | None = None,
+        exact: bool = False, **options: Any,
     ) -> Dataset: ...
     def create_dataset_like(
         self, name: str | bytes, source: Dataset, *, dtype: npt.DTypeLike | None = None
@@ -110,7 +124,16 @@ class File(Group):
     """Own an HDF5 file and close it explicitly or on context exit."""
 
     def __init__(
-        self, filename: str | bytes | PathLike[str] | PathLike[bytes], mode: str = "r"
+        self, filename: str | bytes | PathLike[str] | PathLike[bytes], mode: str = "r", *,
+        driver: Literal["core"] | None = None,
+        backing_store: bool | None = None,
+        block_size: int | None = None,
+        libver: str | tuple[str, str] | None = None,
+        rdcc_nslots: int | None = None,
+        rdcc_nbytes: int | None = None,
+        rdcc_w0: float | None = None,
+        locking: bool | Literal["true", "false", "best-effort"] | None = None,
+        swmr: bool = False,
     ) -> None: ...
     @property
     def name(self) -> str: ...
@@ -118,6 +141,10 @@ class File(Group):
     def parent(self) -> File: ...
     @property
     def closed(self) -> bool: ...
+    @property
+    def swmr_mode(self) -> bool: ...
+    @swmr_mode.setter
+    def swmr_mode(self, value: bool) -> None: ...
     def close(self) -> None: ...
     @property
     def file(self) -> File: ...

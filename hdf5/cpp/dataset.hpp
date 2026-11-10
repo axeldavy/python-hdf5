@@ -14,6 +14,18 @@ struct DatasetSelection {
     std::string dtype;
 };
 
+struct DatasetOptions {
+    std::vector<std::uint64_t> chunks;
+    std::vector<std::uint64_t> maxshape;
+    bool has_maxshape = false;
+    bool has_data = true;
+    bool has_fill = false;
+    AttributeData fill;
+    int gzip_level = -1;
+    bool shuffle = false;
+    bool fletcher32 = false;
+};
+
 enum class SelectionKind { Index, Slice, Ellipsis };
 
 struct SelectionPart {
@@ -96,6 +108,15 @@ public:
     // Return the file holder shared by this dataset.
     std::shared_ptr<FileHandle> file_handle() const noexcept { return parent_->file_; }
 
+    // Flush this dataset or reload it from disk for SWMR readers.
+    Status sync(bool refresh, std::string& error) {
+        std::unique_lock<std::mutex> lock(parent_->file_->mutex_);
+        if (Status status = prepare(error); status != Status::Ok) return status;
+        std::unique_lock<std::mutex> attributes(*parent_->file_->attribute_mutex_);
+        if ((refresh ? H5Drefresh(id_) : H5Dflush(id_)) < 0) return failure(error);
+        return Status::Ok;
+    }
+
     // Resolve a group or open a dataset while retaining the path-walk lock.
     static Status lookup(const std::shared_ptr<GroupHandle>& group, const char* path,
                          std::shared_ptr<GroupHandle>& group_output,
@@ -116,7 +137,8 @@ public:
     // Open a hard-linked dataset or create one from the supplied data.
     // The new link is marked UTF-8 when utf8 is set, and ASCII otherwise.
     static Status open(const std::shared_ptr<GroupHandle>& parent, const char* name, bool create,
-                    const AttributeData& input, std::shared_ptr<DatasetHandle>& output,
+                    const AttributeData& input, const DatasetOptions& options,
+                    std::shared_ptr<DatasetHandle>& output,
                     std::string& error, bool utf8 = false) {
         // Lock the file and inspect the target link.
         std::unique_lock<std::mutex> lock(parent->file_->mutex_);
@@ -175,19 +197,60 @@ public:
 
         // Create the dataspace, datatype, and link.
         std::vector<hsize_t> dims(input.shape.begin(), input.shape.end());
+        std::vector<hsize_t> maxdims(options.maxshape.begin(), options.maxshape.end());
         ScopedId space(dims.empty() ? H5Screate(H5S_SCALAR)
                                    : H5Screate_simple(static_cast<int>(dims.size()), dims.data(),
-                                                      nullptr), H5Sclose);
+                                                      options.has_maxshape ? maxdims.data()
+                                                                           : nullptr), H5Sclose);
         ScopedId properties(H5Pcreate(H5P_LINK_CREATE), H5Pclose);
+        ScopedId creation(H5Pcreate(H5P_DATASET_CREATE), H5Pclose);
         if (type.get() < 0 || space.get() < 0 || properties.get() < 0 ||
+            creation.get() < 0 ||
             H5Pset_char_encoding(properties.get(),
                                      utf8 ? H5T_CSET_UTF8 : H5T_CSET_ASCII) < 0)
             return failure(error);
+        if (!options.chunks.empty()) {
+            std::vector<hsize_t> chunks(options.chunks.begin(), options.chunks.end());
+            if (H5Pset_chunk(creation.get(), static_cast<int>(chunks.size()), chunks.data()) < 0)
+                return failure(error);
+        }
+        if (options.shuffle && H5Pset_shuffle(creation.get()) < 0) return failure(error);
+        if (options.gzip_level >= 0) {
+            unsigned int configuration = 0;
+            if (H5Zfilter_avail(H5Z_FILTER_DEFLATE) <= 0 ||
+                H5Zget_filter_info(H5Z_FILTER_DEFLATE, &configuration) < 0 ||
+                !(configuration & H5Z_FILTER_CONFIG_ENCODE_ENABLED)) {
+                error = "gzip compression filter is not available for encoding";
+                return Status::Failure;
+            }
+            if (H5Pset_deflate(creation.get(),
+                               static_cast<unsigned int>(options.gzip_level)) < 0)
+                return failure(error);
+        }
+        if (options.fletcher32 && H5Pset_fletcher32(creation.get()) < 0) return failure(error);
+        if (options.has_fill) {
+            std::size_t size = 0;
+            const unsigned char* bytes = options.fill.bytes(size);
+            if (is_vlen_name(options.fill.dtype)) {
+                error = "variable-length fill values are not supported";
+                return Status::Unsupported;
+            }
+            if (!bytes || size != H5Tget_size(type.get())) {
+                error = "invalid fill value";
+                return Status::Unsupported;
+            }
+            if (H5Pset_fill_value(creation.get(), type.get(), bytes) < 0) return failure(error);
+        }
         ScopedId dataset(H5Dcreate2(location, name, type.get(), space.get(), properties.get(),
-                                    H5P_DEFAULT, H5P_DEFAULT), H5Dclose);
+                                    creation.get(), H5P_DEFAULT), H5Dclose);
         if (dataset.get() < 0) return failure(error);
 
         // Write the complete dataset and remove the link on write failure.
+        if (!options.has_data) {
+            output = std::make_shared<DatasetHandle>(parent, dataset.get());
+            dataset.release();
+            return Status::Ok;
+        }
         hssize_t points = H5Sget_simple_extent_npoints(space.get());
         if (points < 0) return failure(error);
         Status status = typed_write(type.get(), static_cast<size_t>(points), input, error,
@@ -204,6 +267,23 @@ public:
         // Transfer the open identifier to shared ownership.
         output = std::make_shared<DatasetHandle>(parent, dataset.get());
         dataset.release();
+        return Status::Ok;
+    }
+
+    // Resize a chunked dataset using the requested dimensions.
+    Status resize(const std::vector<std::uint64_t>& shape, std::string& error) {
+        std::unique_lock<std::mutex> lock(parent_->file_->mutex_);
+        if (Status status = prepare(error); status != Status::Ok) return status;
+        ScopedId space(H5Dget_space(id_), H5Sclose);
+        if (space.get() < 0) return failure(error);
+        int rank = H5Sget_simple_extent_ndims(space.get());
+        if (rank < 0) return failure(error);
+        if (shape.size() != static_cast<size_t>(rank) || rank == 0) {
+            error = "new shape must match the dataset rank";
+            return Status::InvalidPath;
+        }
+        std::vector<hsize_t> dims(shape.begin(), shape.end());
+        if (H5Dset_extent(id_, dims.data()) < 0) return failure(error);
         return Status::Ok;
     }
 

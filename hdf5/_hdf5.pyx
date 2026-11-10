@@ -38,13 +38,50 @@ cdef extern from "cpp/file.hpp" namespace "python_hdf5":
 
 
 cdef extern from "cpp/file.hpp" namespace "python_hdf5" nogil:
+    cdef enum class FileDriver:
+        Default
+        Core
+    cdef enum class FileLocking:
+        Default
+        Disabled
+        Enabled
+        BestEffort
+    cdef enum class FileVersion:
+        Default
+        Earliest
+        V108
+        V110
+        V112
+        V114
+        V200
+        Latest
+    cdef cppclass FileOptions:
+        FileOptions() except +
+        FileDriver driver
+        FileLocking locking
+        FileVersion low
+        FileVersion high
+        cpp_bool backing_store
+        size_t block_size
+        cpp_bool has_nslots
+        cpp_bool has_nbytes
+        cpp_bool has_w0
+        cpp_bool swmr_read
+        size_t nslots
+        size_t nbytes
+        double w0
     cdef cppclass FileHandle:
         FileHandle() except +
-        Status open(const char* path, const char* mode, string& error) except +
+        Status open(const char* path, const char* mode, const FileOptions& options,
+                    string& error) except +
         Status close(string& error) except +
         Status flush(string& error) except +
+        Status start_swmr(string& error) except +
+        Status swmr_mode(cpp_bool& enabled, string& error) except +
         cpp_bool closed() except +
         string filename() except +
+        Status cache_settings(size_t& nslots, size_t& nbytes, double& w0, string& error) except +
+        Status core_settings(size_t& block_size, cpp_bool& backing_store, string& error) except +
 
 
 cdef extern from "cpp/group.hpp" namespace "python_hdf5" nogil:
@@ -81,6 +118,17 @@ cdef extern from "cpp/attribute.hpp" namespace "python_hdf5" nogil:
         Status count(uint64_t& out, string& error) except +
 
 cdef extern from "cpp/dataset.hpp" namespace "python_hdf5" nogil:
+    cdef cppclass DatasetOptions:
+        DatasetOptions() except +
+        vector[uint64_t] chunks
+        vector[uint64_t] maxshape
+        cpp_bool has_maxshape
+        cpp_bool has_data
+        cpp_bool has_fill
+        AttributeData fill
+        int gzip_level
+        cpp_bool shuffle
+        cpp_bool fletcher32
     cdef cppclass DatasetSelection:
         vector[uint64_t] shape
         vector[uint64_t] start
@@ -101,12 +149,15 @@ cdef extern from "cpp/dataset.hpp" namespace "python_hdf5" nogil:
                       shared_ptr[DatasetHandle]& dataset_output, string& error) except +
         @staticmethod
         Status open(const shared_ptr[GroupHandle]& parent, const char* name, cpp_bool create,
-                 const AttributeData& input, shared_ptr[DatasetHandle]& output,
+                 const AttributeData& input, const DatasetOptions& options,
+                 shared_ptr[DatasetHandle]& output,
                  string& error, cpp_bool utf8) except +
+        Status resize(const vector[uint64_t]& shape, string& error) except +
         shared_ptr[AttributeHandle] attributes() except +
         Status name(string& output, string& error) except +
         shared_ptr[GroupHandle] parent() except +
         shared_ptr[FileHandle] file_handle() except +
+        Status sync(cpp_bool refresh, string& error) except +
         Status read(AttributeData& output, cpp_bool contents, string& error,
                     cpp_bool include_shape) except +
         Status write(const AttributeData& input, string& error) except +
@@ -483,6 +534,19 @@ cdef object _convert_for_dataset(object value, object dtype, tuple shape, str la
     return result
 
 
+cdef tuple _dataset_shape(object shape):
+    """Validate dimensions for dataset shapes and chunks."""
+    if isinstance(shape, int):
+        shape = (shape,)
+    try:
+        dims = tuple(_file_size(dim, "dimension") for dim in shape)
+    except TypeError:
+        raise TypeError("shape must be an integer or a sequence of integers") from None
+    if len(dims) > 32:
+        raise TypeError("dataset rank exceeds HDF5 limit")
+    return dims
+
+
 cdef object _pack_array(object array, AttributeData& output):
     """Fill an initially empty native transfer object from a prepared array.
 
@@ -702,6 +766,64 @@ cdef class AttributeManager:
         # Translate errors and decode the name snapshot.
         _attribute_error(status, error, None)
         return [_decode_name(<bytes>name) for name in names]
+
+    def create(self, name, data, shape=None, dtype=None):
+        """Create or replace an attribute with an explicit shape and dtype.
+
+        Args:
+            name: Attribute name as str or bytes.
+            data: Scalar or array containing the attribute values.
+            shape: Optional output shape with the same number of elements as data.
+            dtype: Optional supported NumPy or special HDF5-compatible dtype.
+
+        Raises:
+            TypeError: If the name, dtype, shape, or data is unsupported.
+            ValueError: If the shape conflicts with the data, the name is invalid,
+                or the owning file is closed.
+            OverflowError: If a dimension is too large.
+            OSError: If HDF5 cannot replace or write the attribute.
+        """
+        if not self._handle:
+            raise ValueError("attribute manager is not initialized")
+        cdef bytes encoded = _encode_name(name)
+        if not encoded:
+            raise ValueError("attribute name must not be empty")
+
+        if dtype is None:
+            array = _prepare_array(data, "attribute")
+        else:
+            requested = np.dtype(dtype)
+            _check_metadata(requested, "attribute")
+            if requested.fields is not None or requested.subdtype is not None:
+                raise TypeError(f"unsupported attribute dtype: {requested}")
+            if _dtype_class(requested) == "vlenarr":
+                array = _vlen_values(data, requested, ())
+                array = _vlen_arrays(array, requested.metadata["vlen"], "attribute")
+            else:
+                array = np.array(data, dtype=requested, copy=True, order="C", subok=False)
+                if array.dtype.metadata != requested.metadata:
+                    array = array.view(requested)
+                array = _prepare_array(array, "attribute")
+                if (requested.metadata or {}).get("vlen") is bytes:
+                    for item in array.ravel():
+                        if isinstance(item, str):
+                            item.encode("ascii")
+
+        if shape is not None:
+            target_shape = _dataset_shape(shape)
+            if np.prod(target_shape, dtype=object) != array.size:
+                raise ValueError("shape of new attribute conflicts with shape of data")
+            array = array.reshape(target_shape)
+
+        cdef AttributeData input
+        keep = _pack_array(array, input)
+        cdef const char* name_ptr = encoded
+        cdef bint utf8 = _needs_utf8(name)
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._handle.get().write(name_ptr, input, error, utf8)
+        _attribute_error(status, error, name)
 
     def __getitem__(self, name):
         """Read a named attribute into an independent scalar or array."""
@@ -1098,6 +1220,69 @@ cdef class Dataset:
         """
         return self._info(True)
 
+    def flush(self):
+        """Flush this dataset for SWMR readers.
+
+        Raises:
+            ValueError: If the file is closed.
+            OSError: If HDF5 cannot flush the dataset.
+        """
+        if not self._dataset:
+            raise ValueError("dataset is not initialized")
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._dataset.get().sync(False, error)
+        _attribute_error(status, error, None)
+
+    def refresh(self):
+        """Reload this dataset's metadata and data from its file.
+
+        Raises:
+            ValueError: If the file is closed.
+            OSError: If HDF5 cannot refresh the dataset.
+        """
+        if not self._dataset:
+            raise ValueError("dataset is not initialized")
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._dataset.get().sync(True, error)
+        _attribute_error(status, error, None)
+
+    def resize(self, size, axis=None):
+        """Resize a chunked dataset, optionally changing only one axis.
+
+        Args:
+            size: New shape, or the new axis length when axis is given.
+            axis: Optional axis to resize.
+
+        Raises:
+            ValueError: If the file is closed or the new shape is invalid.
+            TypeError: If dimensions are invalid.
+            OSError: If HDF5 cannot resize the dataset.
+        """
+        if not self._dataset:
+            raise ValueError("dataset is not initialized")
+        if axis is None:
+            shape = _dataset_shape(size)
+        else:
+            axis = operator.index(axis)
+            shape = list(self.shape)
+            if axis < 0 or axis >= len(shape):
+                raise ValueError("axis out of range")
+            shape[axis] = _file_size(size, "size")
+        cdef vector[uint64_t] dims
+        for dim in shape:
+            dims.push_back(dim)
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._dataset.get().resize(dims, error)
+        if status == Status.InvalidPath:
+            raise ValueError(error.decode("utf-8", "replace"))
+        _attribute_error(status, error, None)
+
     def write(self, value):
         """Replace the complete dataset, broadcasting and converting the input.
 
@@ -1272,7 +1457,7 @@ cdef class Group:
         return group
 
     cdef object _dataset_at(self, object name, bint create, object value, object dtype,
-                            shared_ptr[GroupHandle] parent):
+                            shared_ptr[GroupHandle] parent, object settings):
         """Open or create a dataset under a safely resolved parent group."""
         # Validate the path and locate its parent.
         cdef bytes encoded = _encode_name(name)
@@ -1296,16 +1481,47 @@ cdef class Group:
 
         # Prepare creation data, then open or create under the native lock.
         cdef AttributeData input
+        cdef DatasetOptions options
         if create:
-            if dtype is None:
-                keep = _pack_array(_prepare_array(value, "dataset"), input)
-            else:
-                requested = np.dtype(dtype)
+            shape, chunks, maxshape, compression, compression_opts, shuffle, fletcher32, fillvalue = settings
+            if value is None:
+                options.has_data = False
+                requested = np.dtype("f4" if dtype is None else dtype)
                 _check_metadata(requested, "dataset")
-                if _dtype_class(requested) == "vlenarr":
-                    value = _vlen_values(value, requested, ())
-                keep = _pack_array(
-                    _convert_for_dataset(value, requested, np.shape(value), "dataset"), input)
+                if requested.fields is not None or requested.subdtype is not None:
+                    raise TypeError(f"unsupported dataset dtype: {requested}")
+                input.dtype = _dtype_name(requested)
+                for dim in shape:
+                    input.shape.push_back(dim)
+            else:
+                if dtype is None:
+                    array = _prepare_array(value, "dataset")
+                    if array.shape != shape:
+                        array = array.reshape(shape)
+                else:
+                    requested = np.dtype(dtype)
+                    _check_metadata(requested, "dataset")
+                    if _dtype_class(requested) == "vlenarr":
+                        value = _vlen_values(value, requested, ())
+                    if np.shape(value) != shape:
+                        value = np.asarray(value).reshape(shape)
+                    array = _convert_for_dataset(value, requested, shape, "dataset")
+                keep = _pack_array(array, input)
+                requested = array.dtype
+            if maxshape is not None:
+                options.has_maxshape = True
+                for dim in maxshape:
+                    options.maxshape.push_back(18446744073709551615 if dim is None else dim)
+            for dim in chunks:
+                options.chunks.push_back(dim)
+            if compression == "gzip":
+                options.gzip_level = 4 if compression_opts is None else compression_opts
+            options.shuffle = shuffle
+            options.fletcher32 = fletcher32
+            if fillvalue is not None:
+                fill_keep = _pack_array(
+                    _convert_for_dataset(fillvalue, requested, (), "dataset"), options.fill)
+                options.has_fill = True
         cdef bytes leaf = parts[-1]
         cdef const char* leaf_ptr = leaf
         cdef shared_ptr[DatasetHandle] handle
@@ -1313,7 +1529,7 @@ cdef class Group:
         cdef string error
         cdef Status status
         with nogil:
-            status = DatasetHandle.open(parent, leaf_ptr, create, input, handle, error, utf8)
+            status = DatasetHandle.open(parent, leaf_ptr, create, input, options, handle, error, utf8)
 
         # Transfer shared native ownership to the Python wrapper.
         _attribute_error(status, error, name)
@@ -1321,15 +1537,25 @@ cdef class Group:
         dataset._dataset = handle
         return dataset
 
-    def create_dataset(self, name, *, data, dtype=None):
-        """Create a numeric or string dataset from data in an existing parent group.
+    def create_dataset(self, name, shape=None, dtype=None, data=None, *, chunks=None,
+                       maxshape=None, compression=None, compression_opts=None, shuffle=False,
+                       fletcher32=False, fillvalue=None):
+        """Create a dataset from data or a shape in an existing parent group.
 
         Args:
             name: Absolute or relative HDF5 dataset path.
-            data: Numeric or string scalar or array to store. Python str is stored as
+            shape: Dataset dimensions. Required if data is omitted.
+            data: Optional numeric or string scalar or array to store. Python str is stored as
                 variable-length UTF-8, bytes as variable-length ASCII, and NumPy bytes
                 arrays as fixed-length strings.
             dtype: Optional dtype to convert the data to, such as string_dtype().
+            chunks: Chunk dimensions, True for automatic chunks, or None.
+            maxshape: Maximum dimensions; None for an unlimited dimension.
+            compression: "gzip" or None.
+            compression_opts: gzip level from 0 to 9.
+            shuffle: Enable the shuffle filter.
+            fletcher32: Enable the Fletcher32 checksum filter.
+            fillvalue: Optional scalar fill value for uninitialized elements.
 
         Returns:
             The newly created dataset.
@@ -1340,20 +1566,76 @@ cdef class Group:
             TypeError: If the datatype, parent, or link is unsupported.
             OSError: If the dataset cannot be created or written.
         """
+        if data is not None and dtype is not None and _dtype_class(np.dtype(dtype)) == "vlenarr":
+            data = _vlen_values(data, np.dtype(dtype), ())
+        if shape is None:
+            if data is None:
+                raise TypeError("shape or data must be provided")
+            shape = np.shape(data)
+        else:
+            shape = _dataset_shape(shape)
+            if data is not None and np.prod(shape, dtype=object) != np.size(data):
+                raise ValueError("shape is incompatible with data")
+        if maxshape is not None:
+            if isinstance(maxshape, int):
+                maxshape = (maxshape,)
+            maxshape = tuple(None if dim is None else _file_size(dim, "maxshape")
+                             for dim in maxshape)
+            if len(maxshape) != len(shape):
+                raise ValueError("maxshape must match dataset rank")
+            if any(limit is not None and dim > limit for dim, limit in zip(shape, maxshape)):
+                raise ValueError("shape exceeds maxshape")
+        if compression not in (None, "gzip"):
+            raise ValueError("only gzip compression is supported")
+        if compression_opts is not None:
+            if compression != "gzip":
+                raise ValueError("compression_opts requires gzip compression")
+            compression_opts = operator.index(compression_opts)
+            if not 0 <= compression_opts <= 9:
+                raise ValueError("gzip compression level must be between 0 and 9")
+        if not isinstance(shuffle, bool) or not isinstance(fletcher32, bool):
+            raise TypeError("shuffle and fletcher32 must be bool")
+        auto_chunk = maxshape is not None or compression is not None or shuffle or fletcher32
+        if chunks is False and auto_chunk:
+            raise ValueError("chunked storage is required for filters and maxshape")
+        if not shape and (auto_chunk or chunks is True or bool(chunks)):
+            raise ValueError("scalar datasets cannot be chunked")
+        if chunks is True or (chunks is None and auto_chunk):
+            itemsize = np.dtype(dtype).itemsize if dtype is not None else np.asarray(data).dtype.itemsize
+            budget = max(1, 1024 * 1024 // max(1, itemsize))
+            chosen = []
+            for dim in reversed(shape):
+                length = min(max(1, dim), 1024, budget)
+                chosen.append(length)
+                budget = max(1, budget // length)
+            chunks = tuple(reversed(chosen))
+        elif chunks is None or chunks is False:
+            chunks = ()
+        else:
+            chunks = _dataset_shape(chunks)
+        if chunks and (len(chunks) != len(shape) or any(dim == 0 for dim in chunks)):
+            raise ValueError("chunks must contain one positive dimension per dataset axis")
+        settings = (shape, chunks, maxshape, compression, compression_opts,
+                    shuffle, fletcher32, fillvalue)
         cdef shared_ptr[GroupHandle] parent
-        return self._dataset_at(name, True, data, dtype, parent)
+        return self._dataset_at(name, True, data, dtype, parent, settings)
 
-    def require_dataset(self, name, *, data, dtype=None):
-        """Return a compatible dataset or create it from data.
+    def require_dataset(self, name, shape=None, dtype=None, *, data=None, exact=False,
+                        **options):
+        """Return a compatible dataset or create it from shape or data.
 
-        An existing dataset must have the same shape. If dtype is supplied, its
-        dtype must match exactly; otherwise the data must be convertible to the
-        existing dataset dtype using the normal write conversion rules.
+        An existing dataset must have the same shape. For shape-based requests,
+        its dtype must match exactly when exact is True, or accept a safe cast
+        from the requested dtype otherwise. Data-only calls retain exact dtype
+        matching for compatibility.
 
         Args:
             name: Absolute or relative HDF5 dataset path.
-            data: Numeric or string scalar or array used to create or validate it.
-            dtype: Optional exact dtype requirement for an existing dataset.
+            shape: Required shape when data is omitted.
+            dtype: Requested dataset dtype.
+            data: Optional data used to create or validate the dataset.
+            exact: Require an exact dtype match for shape-based requests.
+            **options: Dataset creation options when the dataset is missing.
 
         Returns:
             The existing compatible dataset or the newly created dataset.
@@ -1364,26 +1646,34 @@ cdef class Group:
             TypeError: If the existing dataset is incompatible or data is unsupported.
             OSError: If HDF5 cannot create or open the dataset.
         """
-        expected = _prepare_array(data, "dataset")
+        if shape is None and data is None:
+            raise TypeError("shape or data must be provided")
+        if data is None and dtype is None:
+            raise TypeError("dtype must be provided when data is omitted")
+        expected = _prepare_array(data, "dataset") if data is not None else None
+        requested_shape = _dataset_shape(shape) if shape is not None else expected.shape
         expected_dtype = np.dtype(dtype) if dtype is not None else expected.dtype
-        if dtype is not None:
+        if dtype is not None and data is not None:
             _check_metadata(expected_dtype, "dataset")
-            _convert_for_dataset(data, expected_dtype, expected.shape, "dataset")
+            _convert_for_dataset(data, expected_dtype, requested_shape, "dataset")
 
         try:
             dataset = self[name]
         except KeyError:
-            return self.create_dataset(name, data=data, dtype=dtype)
+            return self.create_dataset(name, shape=shape, data=data, dtype=dtype, **options)
 
         if not isinstance(dataset, Dataset):
             raise TypeError("path does not refer to a dataset")
-        if dataset.shape != expected.shape:
+        if dataset.shape != requested_shape:
             raise TypeError(
-                f"existing dataset has shape {dataset.shape}, expected {expected.shape}")
-        if dtype is not None and dataset.dtype != expected_dtype:
+                f"existing dataset has shape {dataset.shape}, expected {requested_shape}")
+        if dtype is not None and (
+                dataset.dtype != expected_dtype and
+                (exact or shape is None or not np.can_cast(expected_dtype, dataset.dtype))):
             raise TypeError(
                 f"existing dataset has dtype {dataset.dtype}, expected {expected_dtype}")
-        _convert_for_dataset(data, dataset.dtype, dataset.shape, "dataset")
+        if data is not None:
+            _convert_for_dataset(data, dataset.dtype, dataset.shape, "dataset")
         return dataset
 
     def create_dataset_like(self, name, source, *, dtype=None):
@@ -1603,6 +1893,40 @@ cdef class Group:
 
 
 # File interface
+cdef FileVersion _file_version(object value) except *:
+    """Translate a supported HDF5 format bound into its native enum."""
+    if not isinstance(value, str):
+        raise TypeError("libver bounds must be strings")
+    if value == "earliest":
+        return FileVersion.Earliest
+    if value == "v108":
+        return FileVersion.V108
+    if value == "v110":
+        return FileVersion.V110
+    if value == "v112":
+        return FileVersion.V112
+    if value == "v114":
+        return FileVersion.V114
+    if value == "v200":
+        return FileVersion.V200
+    if value == "latest":
+        return FileVersion.Latest
+    raise ValueError(f"unsupported libver bound: {value!r}")
+
+
+cdef size_t _file_size(object value, str label) except *:
+    """Validate a nonnegative size without accepting booleans or floats."""
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{label} must be an integer")
+    try:
+        number = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{label} must be an integer") from None
+    if number < 0:
+        raise ValueError(f"{label} must not be negative")
+    return number
+
+
 cdef class File(Group):
     """Own an HDF5 file.
 
@@ -1613,9 +1937,20 @@ cdef class File(Group):
     Args:
         filename: Filesystem path of the file.
         mode: One of r, r+, w, w-, x, or a.
+        driver: None for the default driver or "core" for an in-memory file.
+        backing_store: Whether the core driver writes to disk; defaults to True.
+        block_size: Core driver allocation increment in bytes; defaults to 65536.
+        libver: Minimum format version, or a pair of minimum and maximum versions.
+        rdcc_nslots: Raw chunk cache hash-table slots per dataset.
+        rdcc_nbytes: Raw chunk cache capacity in bytes per dataset.
+        rdcc_w0: Raw chunk cache preemption weight between 0 and 1.
+        locking: None, a boolean, "true", "false", or "best-effort".
+        swmr: Open a read-only SWMR reader.
 
     Raises:
-        ValueError: If mode or filename is invalid.
+        TypeError: If an option has an invalid type.
+        ValueError: If an option, mode or filename is invalid.
+        OverflowError: If an option exceeds the native size limit.
         OSError: If HDF5 cannot open or create the file.
     """
 
@@ -1627,13 +1962,71 @@ cdef class File(Group):
         self._handle = make_shared[FileHandle]()
         self._initialized = False
 
-    def __init__(self, filename, mode="r"):
+    def __init__(self, filename, mode="r", *, driver=None, backing_store=None, block_size=None,
+                 libver=None, rdcc_nslots=None, rdcc_nbytes=None, rdcc_w0=None, locking=None,
+                 swmr=False):
         """Open or create the file with the requested mode."""
         # Validate arguments before attempting to open the native file.
         if self._initialized:
             raise RuntimeError("file is already initialized")
         if mode not in ("r", "r+", "w", "w-", "x", "a"):
             raise ValueError(f"invalid file mode: {mode!r}")
+
+        cdef FileOptions options
+        if not isinstance(swmr, bool):
+            raise TypeError("swmr must be a bool")
+        if swmr and mode != "r":
+            raise ValueError("swmr=True is only supported for read-only mode")
+        options.swmr_read = swmr
+        if driver is not None and driver != "core":
+            raise ValueError(f"unsupported file driver: {driver!r}")
+        if driver == "core":
+            options.driver = FileDriver.Core
+            if backing_store is not None:
+                if not isinstance(backing_store, bool):
+                    raise TypeError("backing_store must be a bool")
+                options.backing_store = backing_store
+            if block_size is not None:
+                options.block_size = _file_size(block_size, "block_size")
+                if options.block_size == 0:
+                    raise ValueError("block_size must be positive")
+        elif backing_store is not None or block_size is not None:
+            raise ValueError("backing_store and block_size require driver='core'")
+
+        if libver is not None:
+            if isinstance(libver, str):
+                low, high = libver, "latest"
+            elif isinstance(libver, tuple) and len(libver) == 2:
+                low, high = libver
+            else:
+                raise TypeError("libver must be a version string or a pair of version strings")
+            options.low = _file_version(low)
+            options.high = _file_version(high)
+            versions = {"earliest": 0, "v108": 1, "v110": 2, "v112": 3,
+                        "v114": 4, "v200": 5, "latest": 5}
+            if versions[high] == 0 or versions[low] > versions[high]:
+                raise ValueError("invalid libver bounds")
+
+        if locking is not None:
+            if locking is True or locking == "true":
+                options.locking = FileLocking.Enabled
+            elif locking is False or locking == "false":
+                options.locking = FileLocking.Disabled
+            elif locking == "best-effort":
+                options.locking = FileLocking.BestEffort
+            else:
+                raise ValueError(f"unsupported locking value: {locking!r}")
+        if rdcc_nslots is not None:
+            options.nslots = _file_size(rdcc_nslots, "rdcc_nslots")
+            options.has_nslots = True
+        if rdcc_nbytes is not None:
+            options.nbytes = _file_size(rdcc_nbytes, "rdcc_nbytes")
+            options.has_nbytes = True
+        if rdcc_w0 is not None:
+            options.w0 = float(rdcc_w0)
+            if not 0 <= options.w0 <= 1:
+                raise ValueError("rdcc_w0 must be between 0 and 1")
+            options.has_w0 = True
 
         cdef bytes path = os.fsencode(filename)
         if b"\0" in path:
@@ -1647,10 +2040,32 @@ cdef class File(Group):
         # Open without the GIL and bind the root group on success.
         self._initialized = True
         with nogil:
-            result = self._handle.get().open(path_ptr, mode_ptr, error)
+            result = self._handle.get().open(path_ptr, mode_ptr, options, error)
         if result != Status.Ok:
             raise OSError(error.decode("utf-8", "replace"))
         self._group = GroupHandle.root(self._handle)
+
+    def _cache_settings(self):
+        """Return effective raw chunk cache settings for diagnostics."""
+        cdef size_t nslots, nbytes
+        cdef double w0
+        cdef string error
+        cdef Status result
+        with nogil:
+            result = self._handle.get().cache_settings(nslots, nbytes, w0, error)
+        _attribute_error(result, error, None)
+        return nslots, nbytes, w0
+
+    def _core_settings(self):
+        """Return effective core driver settings for diagnostics."""
+        cdef size_t block_size
+        cdef cpp_bool backing_store
+        cdef string error
+        cdef Status result
+        with nogil:
+            result = self._handle.get().core_settings(block_size, backing_store, error)
+        _attribute_error(result, error, None)
+        return block_size, bool(backing_store)
 
     @property
     def file(self):
@@ -1676,6 +2091,28 @@ cdef class File(Group):
         with nogil:
             result = self._handle.get().closed()
         return bool(result)
+
+    @property
+    def swmr_mode(self):
+        """Return whether this file is open in SWMR reader or writer mode."""
+        cdef cpp_bool enabled
+        cdef string error
+        cdef Status result
+        with nogil:
+            result = self._handle.get().swmr_mode(enabled, error)
+        _attribute_error(result, error, None)
+        return bool(enabled)
+
+    @swmr_mode.setter
+    def swmr_mode(self, value):
+        """Start SWMR writing; disabling SWMR mode is not supported."""
+        if value is not True:
+            raise ValueError("SWMR mode can only be enabled")
+        cdef string error
+        cdef Status result
+        with nogil:
+            result = self._handle.get().start_swmr(error)
+        _attribute_error(result, error, None)
 
     def close(self):
         """Close the file, waiting for operations on it to finish.
