@@ -2,7 +2,9 @@
 
 #include "file.hpp"
 
+#include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -36,7 +38,9 @@ public:
     // Created links are marked UTF-8 when utf8 is set, and ASCII otherwise.
     Status resolve(const char* path, bool create, bool membership,
                 std::shared_ptr<GroupHandle>& output, std::string& error, bool utf8 = false,
-                bool require = false) {
+                bool require = false,
+                const std::function<Status(const std::shared_ptr<GroupHandle>&, const char*,
+                                           std::string&)>* open_dataset = nullptr) {
         // Guard file state and configure the thread's HDF5 error handler.
         std::unique_lock<std::mutex> lock(file_->mutex_);
         if (file_->id_ < 0) {
@@ -134,6 +138,14 @@ public:
                             output = std::make_shared<GroupHandle>(file_, parent.get());
                             parent.release();
                         }
+                        if (open_dataset) {
+                            if (name.back() == '/') {
+                                error = "invalid dataset path";
+                                return Status::InvalidPath;
+                            }
+                            Status status = (*open_dataset)(output, part.c_str(), error);
+                            if (status != Status::Ok) return status;
+                        }
                         return Status::IsDataset;
                     }
                     error = "path refers to an object that is not a group";
@@ -183,6 +195,26 @@ public:
             output = std::make_shared<GroupHandle>(file_, opened.back()->get());
             opened.back()->release();
         }
+        return Status::Ok;
+    }
+
+    // Count links without collecting their names.
+    Status count(std::uint64_t& output, std::string& error) {
+        std::unique_lock<std::mutex> lock(file_->mutex_);
+        if (file_->id_ < 0) {
+            error = "file is closed";
+            return Status::Closed;
+        }
+        if (H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr) < 0) {
+            error = error_message();
+            return Status::Failure;
+        }
+        H5G_info_t info;
+        if (H5Gget_info(id_ < 0 ? file_->id_ : id_, &info) < 0) {
+            error = error_message();
+            return Status::Failure;
+        }
+        output = info.nlinks;
         return Status::Ok;
     }
 

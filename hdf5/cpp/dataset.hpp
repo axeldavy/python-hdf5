@@ -14,6 +14,44 @@ struct DatasetSelection {
     std::string dtype;
 };
 
+enum class SelectionKind { Index, Slice, Ellipsis };
+
+struct SelectionPart {
+    SelectionKind kind = SelectionKind::Slice;
+    std::int64_t start = 0;
+    std::int64_t stop = 0;
+    std::int64_t step = 1;
+    bool has_start = false;
+    bool has_stop = false;
+};
+
+// Keep ordinary selection descriptions on the stack, bounded by the HDF5 rank limit.
+struct SelectionRequest {
+    std::array<SelectionPart, H5S_MAX_RANK + 1> parts;
+    size_t size = 0;
+
+    void add_index(std::int64_t value) {
+        SelectionPart& part = parts[size++];
+        part.kind = SelectionKind::Index;
+        part.start = value;
+    }
+
+    void add_slice(bool has_start, std::int64_t start, bool has_stop, std::int64_t stop,
+                   std::int64_t step) {
+        SelectionPart& part = parts[size++];
+        part.kind = SelectionKind::Slice;
+        part.has_start = has_start;
+        part.start = start;
+        part.has_stop = has_stop;
+        part.stop = stop;
+        part.step = step;
+    }
+
+    void add_ellipsis() {
+        parts[size++].kind = SelectionKind::Ellipsis;
+    }
+};
+
 // Own a dataset identifier and keep its file and parent group alive.
 class DatasetHandle : public std::enable_shared_from_this<DatasetHandle> {
 public:
@@ -57,6 +95,23 @@ public:
 
     // Return the file holder shared by this dataset.
     std::shared_ptr<FileHandle> file_handle() const noexcept { return parent_->file_; }
+
+    // Resolve a group or open a dataset while retaining the path-walk lock.
+    static Status lookup(const std::shared_ptr<GroupHandle>& group, const char* path,
+                         std::shared_ptr<GroupHandle>& group_output,
+                         std::shared_ptr<DatasetHandle>& dataset_output, std::string& error) {
+        const std::function<Status(const std::shared_ptr<GroupHandle>&, const char*, std::string&)>
+            open_dataset = [&](const std::shared_ptr<GroupHandle>& parent, const char* name,
+                               std::string& detail) {
+                hid_t location = parent->id_ < 0 ? parent->file_->id_ : parent->id_;
+                ScopedId dataset(H5Dopen2(location, name, H5P_DEFAULT), H5Dclose);
+                if (dataset.get() < 0) return failure(detail);
+                dataset_output = std::make_shared<DatasetHandle>(parent, dataset.get());
+                dataset.release();
+                return Status::Ok;
+            };
+        return group->resolve(path, false, false, group_output, error, false, false, &open_dataset);
+    }
 
     // Open a hard-linked dataset or create one from the supplied data.
     // The new link is marked UTF-8 when utf8 is set, and ASCII otherwise.
@@ -153,18 +208,17 @@ public:
     }
 
     // Read metadata and optionally copy all data into output.
-    Status read(AttributeData& output, bool contents, std::string& error) {
+    Status read(AttributeData& output, bool contents, std::string& error,
+                bool include_shape = true) {
         // Lock the file and validate the stored type and dataspace.
         std::unique_lock<std::mutex> lock(parent_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
-        ScopedId type(H5Dget_type(id_), H5Tclose);
+        ScopedId type(H5I_INVALID_HID, H5Tclose);
+        if (Status status = dataset_type(type, contents, error); status != Status::Ok)
+            return status;
         ScopedId space(H5Dget_space(id_), H5Sclose);
-        if (type.get() < 0 || space.get() < 0) return failure(error);
-        output.dtype = dtype_name(type.get());
-        if (output.dtype.empty()) {
-            error = "unsupported dataset datatype";
-            return Status::Unsupported;
-        }
+        if (space.get() < 0) return failure(error);
+        output.dtype = dtype_;
         H5S_class_t space_type = H5Sget_simple_extent_type(space.get());
         if (space_type == H5S_NO_CLASS) return failure(error);
         if (space_type == H5S_NULL) {
@@ -173,8 +227,10 @@ public:
         }
 
         // Collect the shape and return early for metadata-only requests.
-        if (Status status = dataspace_shape(space.get(), output.shape, error);
-            status != Status::Ok) return status;
+        if (include_shape || contents) {
+            if (Status status = dataspace_shape(space.get(), output.shape, error);
+                status != Status::Ok) return status;
+        }
         if (!contents) return Status::Ok;
 
         // Check the transfer size and read into owned storage.
@@ -192,10 +248,11 @@ public:
         // Recheck the stored type and dimensions while holding the file lock.
         std::unique_lock<std::mutex> lock(parent_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
-        ScopedId type(H5Dget_type(id_), H5Tclose);
+        ScopedId type(H5I_INVALID_HID, H5Tclose);
+        if (Status status = dataset_type(type, true, error); status != Status::Ok) return status;
         ScopedId space(H5Dget_space(id_), H5Sclose);
-        if (type.get() < 0 || space.get() < 0) return failure(error);
-        if (!dtype_compatible(dtype_name(type.get()), input.dtype)) {
+        if (space.get() < 0) return failure(error);
+        if (!dtype_compatible(dtype_, input.dtype)) {
             error = "dataset datatype changed during write";
             return Status::Unsupported;
         }
@@ -225,10 +282,11 @@ public:
         // Keep close, resize, and the actual transfer mutually exclusive.
         std::unique_lock<std::mutex> lock(parent_->file_->mutex_);
         if (Status status = prepare(error); status != Status::Ok) return status;
-        ScopedId type(H5Dget_type(id_), H5Tclose);
+        ScopedId type(H5I_INVALID_HID, H5Tclose);
+        if (Status status = dataset_type(type, true, error); status != Status::Ok) return status;
         ScopedId space(H5Dget_space(id_), H5Sclose);
-        if (type.get() < 0 || space.get() < 0) return failure(error);
-        if (dtype_name(type.get()) != selection.dtype ||
+        if (space.get() < 0) return failure(error);
+        if (dtype_ != selection.dtype ||
             (writing && !dtype_compatible(selection.dtype, data.dtype))) {
             error = "dataset datatype changed during selection";
             return Status::Unsupported;
@@ -243,43 +301,156 @@ public:
 
         // Select file coordinates or an empty selection for zero-length slices.
         if (!dims.empty()) {
-            std::vector<hsize_t> start(selection.start.begin(), selection.start.end());
-            std::vector<hsize_t> stride(selection.stride.begin(), selection.stride.end());
-            std::vector<hsize_t> count(selection.count.begin(), selection.count.end());
+            hsize_t start[H5S_MAX_RANK], stride[H5S_MAX_RANK], count[H5S_MAX_RANK];
             bool empty = false;
-            for (hsize_t n : count) empty = empty || n == 0;
+            for (size_t i = 0; i < dims.size(); ++i) {
+                start[i] = selection.start[i];
+                stride[i] = selection.stride[i];
+                count[i] = selection.count[i];
+                empty = empty || count[i] == 0;
+            }
             if ((empty ? H5Sselect_none(space.get())
-                       : H5Sselect_hyperslab(space.get(), H5S_SELECT_SET, start.data(),
-                                             stride.data(), count.data(), nullptr)) < 0)
+                       : H5Sselect_hyperslab(space.get(), H5S_SELECT_SET, start,
+                                             stride, count, nullptr)) < 0)
                 return failure(error);
         }
 
-        // Create a flat memory space with the same selected element count.
-        hssize_t points = H5Sget_select_npoints(space.get());
+        if (!writing) {
+            data.dtype = selection.dtype;
+            data.shape = selection.result_shape;
+        }
+        return selected_transfer(type.get(), space.get(), data, writing, error);
+    }
+
+    // Normalize ordinary selections and read from one fresh dataspace under one lock.
+    Status read_selection(const SelectionRequest& request, AttributeData& data,
+                          std::string& error) {
+        std::unique_lock<std::mutex> lock(parent_->file_->mutex_);
+        if (Status status = prepare(error); status != Status::Ok) return status;
+        ScopedId type(H5I_INVALID_HID, H5Tclose);
+        if (Status status = dataset_type(type, true, error); status != Status::Ok) return status;
+        ScopedId space(H5Dget_space(id_), H5Sclose);
+        if (space.get() < 0) return failure(error);
+        H5S_class_t space_type = H5Sget_simple_extent_type(space.get());
+        if (space_type == H5S_NO_CLASS) return failure(error);
+        if (space_type == H5S_NULL) {
+            error = "null dataset dataspaces are not supported";
+            return Status::Unsupported;
+        }
+        hsize_t dims[H5S_MAX_RANK], start[H5S_MAX_RANK], stride[H5S_MAX_RANK];
+        hsize_t count[H5S_MAX_RANK];
+        int rank = H5Sget_simple_extent_dims(space.get(), dims, nullptr);
+        if (rank < 0) return failure(error);
+        size_t ellipses = 0;
+        for (size_t i = 0; i < request.size; ++i)
+            ellipses += request.parts[i].kind == SelectionKind::Ellipsis;
+        if (ellipses > 1) {
+            error = "only one ellipsis is allowed";
+            return Status::InvalidSelection;
+        }
+        if (request.size - ellipses > static_cast<size_t>(rank)) {
+            error = "too many indices for dataset";
+            return Status::InvalidSelection;
+        }
+        for (int i = 0; i < rank; ++i)
+            if (dims[i] > static_cast<hsize_t>(std::numeric_limits<std::int64_t>::max()))
+                return Status::SelectionFallback;
+
+        const size_t omitted = static_cast<size_t>(rank) - (request.size - ellipses);
+        size_t axis = 0;
+        bool empty = false;
+        data.shape.clear();
+        data.shape.reserve(static_cast<size_t>(rank));
+        auto add_full_axis = [&]() {
+            start[axis] = 0;
+            stride[axis] = 1;
+            count[axis] = dims[axis];
+            data.shape.push_back(dims[axis]);
+            empty = empty || count[axis] == 0;
+            ++axis;
+        };
+        for (size_t i = 0; i < request.size; ++i) {
+            const SelectionPart& part = request.parts[i];
+            if (part.kind == SelectionKind::Ellipsis) {
+                for (size_t n = 0; n < omitted; ++n) add_full_axis();
+                continue;
+            }
+            const std::int64_t dim = static_cast<std::int64_t>(dims[axis]);
+            if (part.kind == SelectionKind::Index) {
+                std::int64_t index = part.start;
+                if (index < 0 && index >= -dim) index += dim;
+                if (index < 0 || index >= dim) {
+                    error = "dataset index out of range";
+                    return Status::InvalidSelection;
+                }
+                start[axis] = static_cast<hsize_t>(index);
+                stride[axis] = count[axis] = 1;
+            } else {
+                auto bound = [dim](std::int64_t value) {
+                    if (value < 0) return value < -dim ? std::int64_t(0) : value + dim;
+                    return std::min(value, dim);
+                };
+                const std::int64_t first = part.has_start ? bound(part.start) : 0;
+                const std::int64_t last = part.has_stop ? bound(part.stop) : dim;
+                const std::int64_t length = last > first ? 1 + (last - first - 1) / part.step : 0;
+                start[axis] = static_cast<hsize_t>(first);
+                stride[axis] = length > 1 ? static_cast<hsize_t>(part.step) : 1;
+                count[axis] = static_cast<hsize_t>(length);
+                data.shape.push_back(static_cast<std::uint64_t>(length));
+                empty = empty || length == 0;
+            }
+            ++axis;
+        }
+        while (axis < static_cast<size_t>(rank)) add_full_axis();
+        if (rank && (empty ? H5Sselect_none(space.get())
+                           : H5Sselect_hyperslab(space.get(), H5S_SELECT_SET, start, stride, count,
+                                                 nullptr)) < 0)
+            return failure(error);
+        data.dtype = dtype_;
+        return selected_transfer(type.get(), space.get(), data, false, error);
+    }
+
+private:
+    // Dataset datatypes cannot change after creation; cache only their decoded description.
+    Status dataset_type(ScopedId& type, bool need_type, std::string& error) {
+        if (need_type || dtype_.empty()) {
+            type.reset(H5Dget_type(id_));
+            if (type.get() < 0) return failure(error);
+            if (dtype_.empty()) {
+                std::string name = dtype_name(type.get());
+                if (name.empty()) {
+                    error = "unsupported dataset datatype";
+                    return Status::Unsupported;
+                }
+                dtype_ = std::move(name);
+            }
+        }
+        return Status::Ok;
+    }
+
+    // Transfer selected points, including empty selections, through a flat memory space.
+    Status selected_transfer(hid_t type, hid_t space, AttributeData& data, bool writing,
+                             std::string& error) {
+        hssize_t points = H5Sget_select_npoints(space);
         if (points < 0) return failure(error);
         hsize_t memory_size = points ? static_cast<hsize_t>(points) : 1;
         ScopedId memory(H5Screate_simple(1, &memory_size, nullptr), H5Sclose);
         if (memory.get() < 0 || (!points && H5Sselect_none(memory.get()) < 0))
             return failure(error);
-
-        // Read or write even empty selections so access errors are not hidden.
         if (writing) {
-            return typed_write(type.get(), static_cast<size_t>(points), data, error,
+            return typed_write(type, static_cast<size_t>(points), data, error,
                                [&](hid_t memory_type_id, const void* buffer) {
                                    return H5Dwrite(id_, memory_type_id, memory.get(),
-                                                   space.get(), H5P_DEFAULT, buffer);
+                                                   space, H5P_DEFAULT, buffer);
                                });
         }
-        data.dtype = selection.dtype;
-        data.shape = selection.result_shape;
-        return typed_read(type.get(), memory.get(), static_cast<size_t>(points), data, error,
+        return typed_read(type, memory.get(), static_cast<size_t>(points), data, error,
                           [&](hid_t memory_type_id, void* buffer) {
-                              return H5Dread(id_, memory_type_id, memory.get(), space.get(),
+                              return H5Dread(id_, memory_type_id, memory.get(), space,
                                              H5P_DEFAULT, buffer);
                           });
     }
 
-private:
     // Check file state and configure error reporting with the file lock held.
     Status prepare(std::string& error) const {
         if (parent_->file_->id_ < 0) {
@@ -296,6 +467,7 @@ private:
     }
     std::shared_ptr<GroupHandle> parent_;
     hid_t id_;
+    std::string dtype_;
 };
 
 }  // namespace python_hdf5

@@ -137,6 +137,17 @@ public:
         return exists ? Status::Ok : Status::NotFound;
     }
 
+    // Count attributes without collecting their names.
+    Status count(std::uint64_t& out, std::string& error) {
+        std::unique_lock<std::mutex> lock(group_->file_->mutex_);
+        if (Status status = prepare(error); status != Status::Ok) return status;
+        std::unique_lock<std::mutex> attribute_lock(*group_->file_->attribute_mutex_);
+        H5O_info2_t info;
+        if (H5Oget_info3(object_id(), &info, H5O_INFO_NUM_ATTRS) < 0) return failure(error);
+        out = info.num_attrs;
+        return Status::Ok;
+    }
+
     // Collect attribute names in HDF5 name order.
     Status names(std::vector<std::string>& out, std::string& error) {
         std::unique_lock<std::mutex> lock(group_->file_->mutex_);

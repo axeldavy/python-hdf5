@@ -74,6 +74,9 @@ Scalar reads return NumPy scalars; array reads return independent arrays. Byte
 order and zero-length dimensions are preserved. Compound, array and reference
 types and null dataspaces are not yet supported. Dtype metadata that cannot be
 stored is rejected with `TypeError` rather than dropped.
+Dataset datatype descriptions are cached per open dataset handle because an HDF5 dataset's
+datatype is immutable; its dataspace and data are not cached. Selected reads use the current
+dataspace, and writes revalidate the shape after preparing the input.
 Callers must not mutate input arrays concurrently with a write. Attribute managers do not cache
 values or names: a completed change is visible to subsequent operations on other managers of the
 same object, including through another file handle in the same process. Attribute operations

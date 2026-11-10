@@ -6,12 +6,18 @@ from libcpp cimport bool as cpp_bool
 from libcpp.memory cimport make_shared, shared_ptr
 from libcpp.string cimport string
 from libcpp.vector cimport vector
-from libc.stdint cimport uint64_t
+from libc.stdint cimport int64_t, uint64_t
 from libc.string cimport memcpy
-from cpython.buffer cimport PyBuffer_FillInfo
+from cpython.buffer cimport (
+    PyBUF_WRITABLE,
+    PyBuffer_FillInfo,
+    PyBuffer_Release,
+    PyObject_GetBuffer,
+)
 from cpython.bytes cimport PyBytes_FromStringAndSize
 
 from collections import namedtuple
+from functools import lru_cache
 import os
 import operator
 import numpy as np
@@ -27,6 +33,8 @@ cdef extern from "cpp/file.hpp" namespace "python_hdf5":
         Unsupported
         InvalidPath
         IsDataset
+        InvalidSelection
+        SelectionFallback
 
 
 cdef extern from "cpp/file.hpp" namespace "python_hdf5" nogil:
@@ -47,6 +55,7 @@ cdef extern from "cpp/group.hpp" namespace "python_hdf5" nogil:
                     shared_ptr[GroupHandle]& output, string& error,
                     cpp_bool utf8, cpp_bool require) except +
         Status names(vector[string]& output, string& error) except +
+        Status count(uint64_t& output, string& error) except +
         Status name(string& output, string& error) except +
         Status remove_link(const char* path, string& error) except +
         shared_ptr[FileHandle] file_handle() except +
@@ -69,6 +78,7 @@ cdef extern from "cpp/attribute.hpp" namespace "python_hdf5" nogil:
         Status remove(const char* name, string& error) except +
         Status contains(const char* name, string& error) except +
         Status names(vector[string]& out, string& error) except +
+        Status count(uint64_t& out, string& error) except +
 
 cdef extern from "cpp/dataset.hpp" namespace "python_hdf5" nogil:
     cdef cppclass DatasetSelection:
@@ -78,7 +88,17 @@ cdef extern from "cpp/dataset.hpp" namespace "python_hdf5" nogil:
         vector[uint64_t] count
         vector[uint64_t] result_shape
         string dtype
+    cdef cppclass SelectionRequest:
+        SelectionRequest() except +
+        void add_index(int64_t value)
+        void add_slice(cpp_bool has_start, int64_t start, cpp_bool has_stop, int64_t stop,
+                       int64_t step)
+        void add_ellipsis()
     cdef cppclass DatasetHandle:
+        @staticmethod
+        Status lookup(const shared_ptr[GroupHandle]& group, const char* path,
+                      shared_ptr[GroupHandle]& group_output,
+                      shared_ptr[DatasetHandle]& dataset_output, string& error) except +
         @staticmethod
         Status open(const shared_ptr[GroupHandle]& parent, const char* name, cpp_bool create,
                  const AttributeData& input, shared_ptr[DatasetHandle]& output,
@@ -87,10 +107,13 @@ cdef extern from "cpp/dataset.hpp" namespace "python_hdf5" nogil:
         Status name(string& output, string& error) except +
         shared_ptr[GroupHandle] parent() except +
         shared_ptr[FileHandle] file_handle() except +
-        Status read(AttributeData& output, cpp_bool contents, string& error) except +
+        Status read(AttributeData& output, cpp_bool contents, string& error,
+                    cpp_bool include_shape) except +
         Status write(const AttributeData& input, string& error) except +
         Status transfer(const DatasetSelection& selection, AttributeData& data, cpp_bool writing,
                      string& error) except +
+        Status read_selection(const SelectionRequest& request, AttributeData& data,
+                              string& error) except +
 
 
 # Shared name, error, and numeric conversion helpers
@@ -236,6 +259,12 @@ cdef bytes _dtype_name(object dtype):
     return dtype.str.encode("ascii")
 
 
+@lru_cache(maxsize=128)
+def _plain_dtype(name: str) -> object:
+    """Return a cached dtype without mutable special-type metadata."""
+    return np.dtype(name)
+
+
 cdef object _dtype_from_name(str name):
     """Return the NumPy dtype for a native dtype name, restoring special-type metadata."""
     if name == "vlen:utf8":
@@ -259,11 +288,15 @@ cdef object _dtype_from_name(str name):
         return np.dtype(f"V{size}")
     if name.endswith(":utf8"):
         return np.dtype(name[:-5], metadata={"h5py_encoding": "utf-8"})
-    return np.dtype(name)
+    return _plain_dtype(name)
 
 
 cdef object _read_dtype(str name):
     """Return the metadata-free dtype that describes the raw bytes of a native name."""
+    if name.startswith("enum:"):
+        return _plain_dtype(name[5:].partition(":")[0])
+    if not name.startswith(("vlen:", "opaque:")) and not name.endswith(":utf8"):
+        return _plain_dtype(name)
     dtype = _dtype_from_name(name)
     if dtype.kind == "O":
         return dtype
@@ -506,6 +539,8 @@ cdef object _unpack_array(AttributeData& result, bint as_str):
     # Restore variable-length data, decoding strings like h5py when requested.
     cdef bytes raw
     cdef size_t index
+    cdef size_t byte_count
+    cdef Py_buffer destination
     cdef _Block block
     name = (<bytes>result.dtype).decode("ascii")
     shape = tuple(result.shape)
@@ -517,10 +552,19 @@ cdef object _unpack_array(AttributeData& result, bint as_str):
                 raw = result.strings[index]
                 flat[index] = raw.decode("utf-8", "surrogateescape") if as_str else raw
         else:
-            element = np.dtype(name[5:])
+            element = _plain_dtype(name[5:])
             for index in range(result.strings.size()):
-                raw = result.strings[index]
-                flat[index] = np.frombuffer(raw, dtype=element).copy()
+                byte_count = result.strings[index].size()
+                if byte_count % element.itemsize:
+                    raise OSError("invalid variable-length transfer size")
+                item = np.empty(byte_count // element.itemsize, dtype=element)
+                if byte_count:
+                    PyObject_GetBuffer(item, &destination, PyBUF_WRITABLE)
+                    try:
+                        memcpy(destination.buf, result.strings[index].data(), byte_count)
+                    finally:
+                        PyBuffer_Release(&destination)
+                flat[index] = item
         return array[()] if not shape else array
 
     # Adopt the native block without copying, including scalar dataspaces.
@@ -534,6 +578,37 @@ cdef object _unpack_array(AttributeData& result, bint as_str):
         array = np.empty(0, dtype=dtype)
     array = array.reshape(shape)
     return array[()] if not shape else array
+
+
+cdef bint _selection_request(object selection, SelectionRequest& request) except -1:
+    """Encode ordinary built-in indices without invoking user-defined index methods."""
+    parts = selection if type(selection) is tuple else (selection,)
+    if len(parts) > 33:
+        return False
+    for part in parts:
+        if part is Ellipsis:
+            request.add_ellipsis()
+        elif type(part) is int:
+            if part < -9223372036854775808 or part > 9223372036854775807:
+                return False
+            request.add_index(part)
+        elif type(part) is slice:
+            start, stop, step = part.start, part.stop, part.step
+            if ((start is not None and (type(start) is not int or
+                                       start < -9223372036854775808 or
+                                       start > 9223372036854775807))
+                    or (stop is not None and (type(stop) is not int or
+                                              stop < -9223372036854775808 or
+                                              stop > 9223372036854775807))
+                    or (step is not None and (type(step) is not int or step <= 0 or
+                                              step > 9223372036854775807))):
+                return False
+            request.add_slice(start is not None, 0 if start is None else start,
+                              stop is not None, 0 if stop is None else stop,
+                              1 if step is None else step)
+        else:
+            return False
+    return True
 
 
 cdef void _normalize_selection(object selection, tuple shape, object dtype,
@@ -554,6 +629,11 @@ cdef void _normalize_selection(object selection, tuple shape, object dtype,
             expanded.append(part)
     expanded.extend([slice(None)] * (len(shape) - len(expanded)))
     output.dtype = _dtype_name(dtype)
+    output.shape.reserve(len(shape))
+    output.start.reserve(len(shape))
+    output.stride.reserve(len(shape))
+    output.count.reserve(len(shape))
+    output.result_shape.reserve(len(shape))
 
     # Convert each dimension to an HDF5 start, stride, and element count.
     for dim, part in zip(shape, expanded):
@@ -695,7 +775,15 @@ cdef class AttributeManager:
 
     def __len__(self):
         """Return the number of attributes."""
-        return len(self.keys())
+        if not self._handle:
+            raise ValueError("attribute manager is not initialized")
+        cdef uint64_t count
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._handle.get().count(count, error)
+        _attribute_error(status, error, None)
+        return count
 
 
 # String dtype helpers
@@ -877,7 +965,7 @@ cdef class Dataset:
         cdef string error
         cdef Status status
         with nogil:
-            status = self._dataset.get().read(output, contents, error)
+            status = self._dataset.get().read(output, contents, error, True)
 
         # Return either metadata or a Python-owned copy of the contents.
         _attribute_error(status, error, None)
@@ -897,7 +985,15 @@ cdef class Dataset:
     @property
     def shape(self):
         """Return the dataset shape."""
-        return self._info(False)[0]
+        if not self._dataset:
+            raise ValueError("dataset is not initialized")
+        cdef AttributeData output
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._dataset.get().read(output, False, error, True)
+        _attribute_error(status, error, None)
+        return tuple(output.shape)
 
     @property
     def name(self):
@@ -944,7 +1040,15 @@ cdef class Dataset:
     @property
     def dtype(self):
         """Return the dataset NumPy dtype."""
-        return self._info(False)[1]
+        if not self._dataset:
+            raise ValueError("dataset is not initialized")
+        cdef AttributeData output
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._dataset.get().read(output, False, error, False)
+        _attribute_error(status, error, None)
+        return _dtype_from_name((<bytes>output.dtype).decode("ascii"))
 
     def __len__(self):
         """Return the length of the first dimension.
@@ -1019,17 +1123,30 @@ cdef class Dataset:
 
     def __getitem__(self, selection):
         """Read integer and positive-slice selections into independent storage."""
-        if (isinstance(selection, tuple) and len(selection) == 0
+        if (selection is Ellipsis
+                or isinstance(selection, tuple) and len(selection) == 0
                 or isinstance(selection, slice) and selection == slice(None)):
             return self.read()
 
-        # Normalize the selection before transferring under the native lock.
-        shape, dtype = self._info(False)
+        if not self._dataset:
+            raise ValueError("dataset is not initialized")
+        cdef SelectionRequest request
         cdef DatasetSelection normalized
-        _normalize_selection(selection, shape, dtype, normalized)
         cdef AttributeData output
         cdef string error
         cdef Status status
+        if _selection_request(selection, request):
+            with nogil:
+                status = self._dataset.get().read_selection(request, output, error)
+            if status == Status.InvalidSelection:
+                raise IndexError(error.decode("utf-8", "replace"))
+            if status != Status.SelectionFallback:
+                _attribute_error(status, error, None)
+                return _unpack_array(output, False)
+
+        # Preserve Python index protocol and arbitrary-size index semantics.
+        shape, dtype = self._info(False)
+        _normalize_selection(selection, shape, dtype, normalized)
         with nogil:
             status = self._dataset.get().transfer(normalized, output, False, error)
         _attribute_error(status, error, None)
@@ -1415,13 +1532,25 @@ cdef class Group:
 
     def __getitem__(self, name):
         """Open a group or dataset at the requested path."""
-        # Resolve the link type before wrapping the corresponding handle.
+        if not self._group:
+            raise ValueError("group is not initialized")
+        cdef bytes encoded = _encode_name(name)
+        cdef const char* path = encoded
         cdef shared_ptr[GroupHandle] handle
-        cdef Status result = self._resolve(name, False, False, handle)
+        cdef shared_ptr[DatasetHandle] dataset_handle
+        cdef string error
+        cdef Status result
+        with nogil:
+            result = DatasetHandle.lookup(self._group, path, handle, dataset_handle, error)
         if result == Status.NotFound:
             raise KeyError(name)
         if result == Status.IsDataset:
-            return self._dataset_at(name, False, None, None, handle)
+            dataset = Dataset.__new__(Dataset)
+            (<Dataset>dataset)._dataset = dataset_handle
+            return dataset
+        if result == Status.InvalidPath:
+            raise ValueError(error.decode("utf-8", "replace"))
+        _attribute_error(result, error, name)
         cdef Group group = Group.__new__(Group)
         group._group = handle
         return group
@@ -1462,7 +1591,15 @@ cdef class Group:
 
     def __len__(self):
         """Return the number of links in this group."""
-        return len(self.keys())
+        if not self._group:
+            raise ValueError("group is not initialized")
+        cdef uint64_t count
+        cdef string error
+        cdef Status status
+        with nogil:
+            status = self._group.get().count(count, error)
+        _attribute_error(status, error, None)
+        return count
 
 
 # File interface

@@ -66,6 +66,12 @@ def test_nonstandard_numeric_precision_is_rejected(tmp_path: Path, h5py_python: 
             _ = file.attrs["attribute"]
         with pytest.raises(TypeError, match="unsupported"):
             _ = _ds(file, "data")[:]
+        dataset = _ds(file, "data")
+        for action in (lambda: dataset.shape, lambda: dataset.dtype):
+            with pytest.raises(TypeError, match="unsupported"):
+                action()
+        with pytest.raises(TypeError, match="unsupported"):
+            _ = dataset[0]
 
 
 def test_special_dtypes_read_h5py_files(tmp_path: Path, h5py_python: str) -> None:
@@ -189,6 +195,19 @@ def test_enum_roundtrip_and_conversion(tmp_path: Path) -> None:
         assert hdf5.check_enum_dtype(dataset.dtype) == {"X": 0, "Y": 1}
         dataset[0] = 1
         assert dataset[:].tolist() == [1, 1]
+
+
+def test_enum_dtype_metadata_is_independent(tmp_path: Path) -> None:
+    """Keep mutable enum metadata separate between repeated dtype queries."""
+    enum = hdf5.enum_dtype({"X": 0, "Y": 1}, "u2")
+    with File(tmp_path / "enum-metadata.h5", "w") as file:
+        dataset = file.create_dataset("e", data=[0, 1], dtype=enum)
+        first = hdf5.check_enum_dtype(dataset.dtype)
+        assert first is not None
+        first["X"] = 42
+        first["NEW"] = 3
+        assert hdf5.check_enum_dtype(dataset.dtype) == {"X": 0, "Y": 1}
+        assert dataset[...].tolist() == [0, 1]
 
 
 def test_vlen_helpers_and_errors(tmp_path: Path) -> None:

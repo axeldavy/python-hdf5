@@ -88,6 +88,35 @@ def test_attributes_second_manager_sees_add_replace_delete(tmp_path: Path) -> No
         assert second["x"] == 2.5 and len(first) == len(second) == 1
 
 
+def test_counts_follow_changes_across_file_handles(tmp_path: Path) -> None:
+    """Count links and attributes without caching names across file handles."""
+    path = tmp_path / "counts.h5"
+    first = File(path, "w")
+    group = first.create_group("group")
+    second = File(path, "r+")
+    other = _grp(second, "group")
+    attrs = group.attrs
+    other_attrs = other.attrs
+    assert len(group) == len(other) == len(attrs) == len(other_attrs) == 0
+    for index in range(50):
+        group.create_dataset(f"d{index}", data=index)
+        attrs[f"a{index}"] = index
+    group.create_group(b"\xff")
+    attrs[b"\xff"] = 1
+    assert len(other) == len(other_attrs) == 51
+    del other[b"\xff"]
+    del other_attrs[b"\xff"]
+    del other["d0"]
+    del other_attrs["a0"]
+    assert len(group) == len(attrs) == 49
+    first.close()
+    for value in (group, attrs):
+        with pytest.raises(ValueError, match="closed"):
+            len(value)
+    assert len(other) == len(other_attrs) == 49
+    second.close()
+
+
 def test_attributes_of_group_and_dataset_are_independent(tmp_path: Path) -> None:
     """Keep attributes with the same name on different objects separate."""
     with File(tmp_path / "a.h5", "w") as file:

@@ -152,6 +152,45 @@ def test_transfer_special_dtype_selections_and_attributes(tmp_path: Path) -> Non
         assert _ds(file, "o")[0] == np.void(b"zz")
 
 
+@pytest.mark.parametrize("dtype", ["<i4", ">i4"])
+def test_transfer_vlen_results_are_independent(tmp_path: Path, dtype: str) -> None:
+    """Keep whole, selected and attribute vlen arrays writable after file close."""
+    items = np.empty(3, dtype=hdf5.vlen_dtype(dtype))
+    items[0] = np.array([1, 2, 3], dtype=dtype)
+    items[1] = np.array([], dtype=dtype)
+    items[2] = np.array([4, 5], dtype=dtype)
+    scalar = np.empty((), dtype=hdf5.vlen_dtype(dtype))
+    scalar[()] = items[0]
+    with File(tmp_path / "vlen-independent.h5", "w") as file:
+        dataset = file.create_dataset("v", data=items)
+        scalar_dataset = file.create_dataset("scalar", data=scalar)
+        file.attrs["v"] = items
+        whole = np.asarray(dataset[...])
+        selected = np.asarray(dataset[1:])
+        single = np.asarray(dataset[0])
+        scalar_result = np.asarray(scalar_dataset[...])
+        attribute = np.asarray(file.attrs["v"])
+        whole_first = np.asarray(whole[0])
+        selected_empty = np.asarray(selected[0])
+        selected_last = np.asarray(selected[1])
+        attribute_first = np.asarray(attribute[0])
+        for value in (whole_first, np.asarray(whole[1]), selected_empty, selected_last,
+                      single, scalar_result, attribute_first):
+            assert value.dtype == np.dtype(dtype)
+            assert value.flags.writeable and value.flags.owndata
+        whole_first[0] = -1
+        single[1] = -2
+        scalar_result[2] = -3
+        attribute_first[0] = -4
+        assert np.asarray(dataset[0]).tolist() == [1, 2, 3]
+        assert np.asarray(file.attrs["v"])[0].tolist() == [1, 2, 3]
+    assert whole_first.tolist() == [-1, 2, 3]
+    assert selected_empty.tolist() == [] and selected_last.tolist() == [4, 5]
+    assert single.tolist() == [1, -2, 3]
+    assert scalar_result.tolist() == [1, 2, -3]
+    assert attribute_first.tolist() == [-4, 2, 3]
+
+
 def test_transfer_special_dtype_errors(tmp_path: Path) -> None:
     """Reject invalid special-type inputs without changing the stored data."""
     with File(tmp_path / "a.h5", "w") as file:

@@ -19,6 +19,8 @@ enum class Status : int {
     Unsupported = 3,   // Unsupported type, link or object (maps to TypeError)
     InvalidPath = 4,   // Malformed path (maps to ValueError)
     IsDataset = 5,     // Path resolved to a dataset rather than a group
+    InvalidSelection = 6, // Invalid dataset index (maps to IndexError)
+    SelectionFallback = 7, // Selection needs Python normalization
 };
 
 class GroupHandle;

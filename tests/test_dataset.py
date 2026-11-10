@@ -268,6 +268,11 @@ def test_dataset_h5py_interoperability(tmp_path: Path, h5py_python: str) -> None
         assert isinstance(unsupported, Dataset)
         with pytest.raises(TypeError):
             unsupported.read()
+        for action in (lambda: unsupported.shape, lambda: unsupported.dtype):
+            with pytest.raises(TypeError, match="null"):
+                action()
+        with pytest.raises(TypeError, match="null"):
+            _ = unsupported[0]
         with pytest.raises(TypeError, match="links"):
             _ = file["soft"]
         created = file.create_dataset("created", data=np.array([3, 4], dtype=">u2"))
