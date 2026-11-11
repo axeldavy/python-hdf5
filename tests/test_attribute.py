@@ -81,7 +81,8 @@ def test_attribute_unsupported_and_readonly(tmp_path: Path) -> None:
     path = tmp_path / "unsupported.h5"
     with File(path, "w") as file:
         file.attrs["value"] = 23
-        for value in (np.array(["text"]), np.array([object()]), np.zeros(1, dtype=[("a", "i4")]), np.array(["2020"], dtype="M8[s]")):
+        for value in (np.array(["text"]), np.array([object()]),
+                      np.array(["2020"], dtype="M8[s]")):
             with pytest.raises(TypeError, match="unsupported"):
                 file.attrs["value"] = value
             assert file.attrs["value"] == 23

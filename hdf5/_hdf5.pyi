@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 class AttributeManager:
-    """Access numeric and string attributes on a file, group, or dataset."""
+    """Access supported attributes on a file, group, or dataset."""
 
     def create(
         self, name: str | bytes, data: npt.ArrayLike, shape: int | tuple[int, ...] | None = None,
@@ -51,7 +51,7 @@ class _ReadAdapter:
     def __len__(self) -> int: ...
 
 class Dataset:
-    """Access a numeric or string dataset."""
+    """Access a supported HDF5 dataset."""
 
     @property
     def attrs(self) -> AttributeManager: ...

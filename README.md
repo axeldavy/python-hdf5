@@ -101,8 +101,10 @@ iteration, `keys()` and `len`. Attributes may be numeric NumPy arrays or scalars
 signed and unsigned 8/16/32/64-bit integers, 16/32/64-bit floats, complex,
 and booleans, plus the strings and special types described below.
 Scalar reads return NumPy scalars; array reads return independent arrays. Byte
-order and zero-length dimensions are preserved. Compound, array and reference
-types and null dataspaces are not yet supported. Dtype metadata that cannot be
+order and zero-length dimensions are preserved. Fixed-size compound attributes,
+including nested records and fixed-size array members, are supported. Variable-length
+compound members, top-level HDF5 array types, references and null dataspaces are not yet
+supported. Dtype metadata that cannot be
 stored is rejected with `TypeError` rather than dropped.
 `attrs.create(name, data, shape=None, dtype=None)` creates or replaces an attribute
 with an explicit dtype and/or shape. A supplied shape must have the same number
@@ -150,9 +152,10 @@ end, and empty slices are supported. Slice writes broadcast to the selected
 shape. Negative and zero slice steps, boolean/fancy indexing, and new axes are
 not supported. Basic selections access HDF5 hyperslabs without reading the whole
 dataset. The supported types
-match attribute types above. Compound, array, reference and other datatypes, null
-dataspaces, and datasets requiring unavailable compression filters are not yet
-supported. Writes are not transactional.
+match attribute types above. Fixed-size compound records, including nested records and
+fixed-size array members, are supported. Variable-length compound members, top-level
+HDF5 array types, references and other datatypes, null dataspaces, and datasets requiring
+unavailable compression filters are not yet supported. Writes are not transactional.
 
 ### SWMR access
 
@@ -209,10 +212,10 @@ values by bytes; strings are never parsed as numbers.
 | Files | Modes `r`, `r+`, `w`, `w-`, `x`, `a`; `flush`, `close`, context manager; core in-memory driver; raw chunk cache, libver and file-locking options; thread-safe per-file locking | Other drivers, file images and file-like objects, metadata cache configuration, user blocks |
 | Groups | Create (with intermediate groups), lookup, membership, `keys`, iteration, `len`; absolute and relative paths | Soft, external and user-defined links (listed, not traversed), `..` paths, deleting or moving links, `visit`/`walk`, creation properties |
 | Datasets | Create from data or shape and dtype; chunking, gzip, shuffle, Fletcher32, fixed-size fill values, resize; `shape`, `dtype`, `read`/`write`, positive-step slices, integers, tuples, ellipsis, `asstr`, `astype`, `len` | Variable-length fill values, other compression filters, creation-property introspection, negative or zero steps, fancy or boolean indexing, new axes, null dataspaces, region and virtual datasets |
-| Attributes | Read, write, explicit `create` with dtype and shape, delete, membership, iteration, `keys`, `len` on files, groups and datasets | Atomic replacement, null dataspaces |
+| Attributes | Read, write, explicit `create` with dtype and shape, fixed-size compound records and array members, delete, membership, iteration, `keys`, `len` on files, groups and datasets | Variable-length compound members, top-level HDF5 array types, atomic replacement, null dataspaces |
 | Numeric types | 8/16/32/64-bit signed and unsigned integers, float16/32/64, complex64/128, bool, either byte order | 128-bit and extended floats, bit fields |
 | Strings | Variable-length and fixed-length, UTF-8 and ASCII, h5py-compatible reads and writes | Fixed-width `U` arrays, mixed `str`/`bytes` arrays, embedded null bytes |
-| Special types | Enums, opaque (including tagged `datetime64`/`timedelta64`), variable-length integer and float arrays | Compound, array, object and region references, time types, bitfields |
+| Special types | Enums, opaque (including tagged `datetime64`/`timedelta64`), variable-length integer and float arrays, fixed-size compound records and array members | Variable-length compound members, top-level HDF5 array types, object and region references, time types, bitfields |
 | Names | `str` as UTF-8, `bytes` unchanged, character set flags like h5py | Names containing null bytes |
 | Convenience API | `keys`, `items`, `values`, `get`, `name`, `parent`, `file`, `require_group`, `require_dataset`, `create_dataset_like`, iteration, `len`, `in`, `[]`, `del group[name]` | |
 | SWMR | Reader open, writer activation, dataset flush and refresh | Multi-writer access, process notifications |

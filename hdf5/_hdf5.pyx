@@ -250,12 +250,25 @@ cdef bint _is_opaque(object dtype):
 
 cdef str _dtype_class(object dtype):
     """Classify a dtype as numeric, fixed, vlenstr, vlenarr, or opaque."""
+    if dtype.fields is not None:
+        return "compound"
+    if dtype.subdtype is not None:
+        return "array"
     if dtype.kind == "O":
         metadata = dtype.metadata or {}
         return "vlenstr" if metadata.get("vlen") in (str, bytes) else "vlenarr"
     if dtype.kind == "S":
         return "fixed"
     return "opaque" if _is_opaque(dtype) else "numeric"
+
+
+cdef bint _dtype_has_vlen(object dtype):
+    """Return whether a dtype contains object storage requiring Python-owned data."""
+    if dtype.fields is not None:
+        return any(_dtype_has_vlen(dtype.fields[name][0]) for name in dtype.names)
+    if dtype.subdtype is not None:
+        return _dtype_has_vlen(dtype.subdtype[0])
+    return dtype.kind == "O"
 
 
 cdef bytes _enum_name(object dtype):
@@ -298,6 +311,26 @@ cdef bytes _vlen_name(object dtype):
 
 cdef bytes _dtype_name(object dtype):
     """Return the native dtype name used to describe dtype in transfers."""
+    if dtype.fields is not None:
+        if _dtype_has_vlen(dtype):
+            raise TypeError("variable-length compound members are not supported")
+        members = []
+        for field_name in dtype.names:
+            field_dtype, offset = dtype.fields[field_name][:2]
+            member_name = _dtype_name(field_dtype)
+            members.append(
+                str(offset).encode("ascii") + b":" +
+                _escape_name(field_name.encode("utf-8")) + b":" +
+                _escape_name(member_name)
+            )
+        return b"compound:" + str(dtype.itemsize).encode("ascii") + b":" + b",".join(members)
+    if dtype.subdtype is not None:
+        if _dtype_has_vlen(dtype):
+            raise TypeError("variable-length array members are not supported")
+        base, shape = dtype.subdtype
+        dimensions = b",".join(str(dim).encode("ascii") for dim in shape)
+        return (b"array:" + str(len(shape)).encode("ascii") + b":" + dimensions + b":" +
+                _escape_name(_dtype_name(base)))
     metadata = dtype.metadata or {}
     if dtype.kind == "O":
         return _vlen_name(dtype)
@@ -318,6 +351,33 @@ def _plain_dtype(name: str) -> object:
 
 cdef object _dtype_from_name(str name):
     """Return the NumPy dtype for a native dtype name, restoring special-type metadata."""
+    if name.startswith("compound:"):
+        size, _, body = name[9:].partition(":")
+        names = []
+        formats = []
+        offsets = []
+        for member in filter(None, body.split(",")):
+            offset, _, description = member.partition(":")
+            field_name, _, child = description.partition(":")
+            raw_name = _unquote_bytes(field_name)
+            try:
+                decoded_name = raw_name.decode("utf-8")
+            except UnicodeDecodeError:
+                decoded_name = raw_name
+            names.append(decoded_name)
+            offsets.append(int(offset))
+            formats.append(_dtype_from_name(_unquote_bytes(child).decode("ascii")))
+        if not names:
+            raise TypeError(f"unsupported compound datatype: {name}")
+        return np.dtype({"names": names, "formats": formats, "offsets": offsets,
+                         "itemsize": int(size)})
+    if name.startswith("array:"):
+        rank, _, remainder = name[6:].partition(":")
+        dimensions, _, child = remainder.partition(":")
+        shape = tuple(int(dim) for dim in dimensions.split(","))
+        if len(shape) != int(rank):
+            raise TypeError(f"unsupported array datatype: {name}")
+        return np.dtype((_dtype_from_name(_unquote_bytes(child).decode("ascii")), shape))
     if name == "vlen:utf8":
         return _vlen_dtype(str)
     if name == "vlen:ascii":
@@ -344,6 +404,8 @@ cdef object _dtype_from_name(str name):
 
 cdef object _read_dtype(str name):
     """Return the metadata-free dtype that describes the raw bytes of a native name."""
+    if name.startswith(("compound:", "array:")):
+        return _dtype_from_name(name)
     if name.startswith("enum:"):
         return _plain_dtype(name[5:].partition(":")[0])
     if not name.startswith(("vlen:", "opaque:")) and not name.endswith(":utf8"):
@@ -373,6 +435,49 @@ cdef object _check_metadata(object dtype, str label):
             dtype.kind in "MmV" or dtype.kind in "iufcb"):
         return
     raise TypeError(f"unsupported {label} dtype with special type metadata: {dtype}")
+
+
+cdef void _validate_dtype(object dtype, str label, bint allow_vlen,
+                          bint nested) except *:
+    """Validate a supported dtype recursively before passing it to HDF5."""
+    _check_metadata(dtype, label)
+    if dtype.fields is not None:
+        if not dtype.names:
+            raise TypeError(f"unsupported {label} compound dtype: {dtype}")
+        if _dtype_has_vlen(dtype):
+            raise TypeError(f"variable-length compound members are not supported for {label}s")
+        for name in dtype.names:
+            _validate_dtype(dtype.fields[name][0], label, False, True)
+        _dtype_name(dtype)
+        return
+    if dtype.subdtype is not None:
+        if not nested:
+            raise TypeError(f"top-level HDF5 array dtypes are not supported for {label}s")
+        if _dtype_has_vlen(dtype):
+            raise TypeError(f"variable-length array members are not supported for {label}s")
+        _validate_dtype(dtype.subdtype[0], label, False, True)
+        _dtype_name(dtype)
+        return
+    kind = dtype.kind
+    if kind == "O":
+        if not allow_vlen:
+            raise TypeError(f"variable-length members are not supported for {label}s")
+        _vlen_name(dtype)
+        return
+    if _is_opaque(dtype):
+        return
+    if kind in ("M", "m"):
+        raise TypeError(f"unsupported {label} dtype: {dtype}; use opaque_dtype()")
+    if kind == "S":
+        if dtype.itemsize == 0:
+            raise TypeError(f"unsupported {label} dtype: {dtype}")
+        return
+    if kind not in ("i", "u", "f", "b", "c"):
+        raise TypeError(f"unsupported {label} dtype: {dtype}")
+    if ((kind in ("i", "u") and dtype.itemsize not in (1, 2, 4, 8))
+            or (kind == "f" and dtype.itemsize not in (2, 4, 8))
+            or (kind == "c" and dtype.itemsize not in (8, 16))):
+        raise TypeError(f"unsupported {label} dtype: {dtype}")
 
 
 cdef object _string_objects(object array, str label):
@@ -431,6 +536,11 @@ cdef object _prepare_array(object value, str label):
     _check_metadata(array.dtype, label)
     kind = array.dtype.kind
     metadata = array.dtype.metadata or {}
+
+    # Preserve fixed-size record and array layouts exactly as NumPy defines them.
+    if array.dtype.fields is not None or array.dtype.subdtype is not None:
+        _validate_dtype(array.dtype, label, False, False)
+        return array
 
     # Treat lists of str or bytes as variable-length strings, unlike explicit NumPy arrays.
     if kind in ("U", "S") and not isinstance(value, (np.ndarray, np.generic)):
@@ -793,9 +903,7 @@ cdef class AttributeManager:
             array = _prepare_array(data, "attribute")
         else:
             requested = np.dtype(dtype)
-            _check_metadata(requested, "attribute")
-            if requested.fields is not None or requested.subdtype is not None:
-                raise TypeError(f"unsupported attribute dtype: {requested}")
+            _validate_dtype(requested, "attribute", True, False)
             if _dtype_class(requested) == "vlenarr":
                 array = _vlen_values(data, requested, ())
                 array = _vlen_arrays(array, requested.metadata["vlen"], "attribute")
@@ -1071,7 +1179,7 @@ cdef class _ReadAdapter:
 
 # Dataset interface
 cdef class Dataset:
-    """Access a numeric or string HDF5 dataset with synchronized I/O."""
+    """Access supported HDF5 datasets with synchronized I/O."""
 
     cdef shared_ptr[DatasetHandle] _dataset
 
@@ -1487,9 +1595,7 @@ cdef class Group:
             if value is None:
                 options.has_data = False
                 requested = np.dtype("f4" if dtype is None else dtype)
-                _check_metadata(requested, "dataset")
-                if requested.fields is not None or requested.subdtype is not None:
-                    raise TypeError(f"unsupported dataset dtype: {requested}")
+                _validate_dtype(requested, "dataset", True, False)
                 input.dtype = _dtype_name(requested)
                 for dim in shape:
                     input.shape.push_back(dim)
@@ -1500,7 +1606,7 @@ cdef class Group:
                         array = array.reshape(shape)
                 else:
                     requested = np.dtype(dtype)
-                    _check_metadata(requested, "dataset")
+                    _validate_dtype(requested, "dataset", True, False)
                     if _dtype_class(requested) == "vlenarr":
                         value = _vlen_values(value, requested, ())
                     if np.shape(value) != shape:
@@ -1654,7 +1760,7 @@ cdef class Group:
         requested_shape = _dataset_shape(shape) if shape is not None else expected.shape
         expected_dtype = np.dtype(dtype) if dtype is not None else expected.dtype
         if dtype is not None and data is not None:
-            _check_metadata(expected_dtype, "dataset")
+            _validate_dtype(expected_dtype, "dataset", True, False)
             _convert_for_dataset(data, expected_dtype, requested_shape, "dataset")
 
         try:

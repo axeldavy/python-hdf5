@@ -205,11 +205,11 @@ def test_transfer_special_dtype_errors(tmp_path: Path) -> None:
             _ds(file, "v")[0] = "text"
         with pytest.raises(TypeError):
             hdf5.opaque_dtype(np.dtype([("a", "i4")]))
-        with pytest.raises(TypeError):
-            file.attrs["x"] = np.zeros(2, dtype=[("a", "i4")])
+        file.attrs["x"] = np.zeros(2, dtype=[("a", "i4")])
+        np.testing.assert_array_equal(file.attrs["x"]["a"], [0, 0])
         with pytest.raises(TypeError):
             file.attrs["x"] = np.zeros(2, dtype="c32")
-        assert "x" not in file.attrs
+        assert "x" in file.attrs
         assert _ds(file, "i")[:].tolist() == [0, 1, 2]
 
 

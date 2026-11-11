@@ -427,6 +427,92 @@ inline bool parse_string_dtype(const std::string& name, StringSpec& spec) {
     return true;
 }
 
+// Parse a decimal size without accepting empty, malformed, or overflowing values.
+inline bool parse_size(const std::string& text, size_t& value) {
+    if (text.empty()) return false;
+    value = 0;
+    for (unsigned char digit : text) {
+        if (digit < '0' || digit > '9') return false;
+        size_t number = digit - '0';
+        if (value > (std::numeric_limits<size_t>::max() - number) / 10) return false;
+        value = value * 10 + number;
+    }
+    return true;
+}
+
+inline hid_t owned_type(const std::string& name);
+
+// Create an owned compound type from a recursively escaped dtype description.
+inline hid_t compound_type(const std::string& name) {
+    if (name.rfind("compound:", 0) != 0) return H5I_INVALID_HID;
+    size_t size_end = name.find(':', 9);
+    size_t size = 0;
+    if (size_end == std::string::npos || !parse_size(name.substr(9, size_end - 9), size) ||
+        !size)
+        return H5I_INVALID_HID;
+    ScopedId type(H5Tcreate(H5T_COMPOUND, size), H5Tclose);
+    if (type.get() < 0) return H5I_INVALID_HID;
+
+    // Decode and insert each member while checking its complete encoded layout.
+    std::string members = name.substr(size_end + 1);
+    size_t start = 0;
+    size_t count = 0;
+    while (start < members.size()) {
+        size_t end = members.find(',', start);
+        std::string member = members.substr(
+            start, end == std::string::npos ? end : end - start);
+        start = end == std::string::npos ? members.size() : end + 1;
+        size_t first = member.find(':');
+        size_t second = first == std::string::npos ? first : member.find(':', first + 1);
+        size_t offset = 0;
+        std::string field_name, child_name;
+        if (first == std::string::npos || second == std::string::npos ||
+            !parse_size(member.substr(0, first), offset) ||
+            !unescape_name(member.substr(first + 1, second - first - 1), field_name) ||
+            !unescape_name(member.substr(second + 1), child_name) || field_name.empty())
+            return H5I_INVALID_HID;
+        ScopedId field(owned_type(child_name), H5Tclose);
+        if (field.get() < 0 || offset > size ||
+            H5Tget_size(field.get()) > size - offset ||
+            H5Tinsert(type.get(), field_name.c_str(), offset, field.get()) < 0)
+            return H5I_INVALID_HID;
+        ++count;
+    }
+    return count ? type.release() : H5I_INVALID_HID;
+}
+
+// Create an owned HDF5 array datatype from its dimensions and element type.
+inline hid_t array_type(const std::string& name) {
+    if (name.rfind("array:", 0) != 0) return H5I_INVALID_HID;
+    size_t rank_end = name.find(':', 6);
+    size_t dims_end = rank_end == std::string::npos ? rank_end : name.find(':', rank_end + 1);
+    size_t rank = 0;
+    if (rank_end == std::string::npos || dims_end == std::string::npos ||
+        !parse_size(name.substr(6, rank_end - 6), rank) || !rank ||
+        rank > H5S_MAX_RANK)
+        return H5I_INVALID_HID;
+    std::vector<hsize_t> dims;
+    std::string dimensions = name.substr(rank_end + 1, dims_end - rank_end - 1);
+    size_t start = 0;
+    while (start <= dimensions.size()) {
+        size_t end = dimensions.find(',', start);
+        size_t dimension = 0;
+        if (!parse_size(dimensions.substr(
+                            start, end == std::string::npos ? end : end - start), dimension) ||
+            !dimension)
+            return H5I_INVALID_HID;
+        dims.push_back(dimension);
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    std::string child_name;
+    if (dims.size() != rank || !unescape_name(name.substr(dims_end + 1), child_name))
+        return H5I_INVALID_HID;
+    ScopedId base(owned_type(child_name), H5Tclose);
+    if (base.get() < 0) return H5I_INVALID_HID;
+    return H5Tarray_create2(base.get(), static_cast<unsigned>(rank), dims.data());
+}
+
 // Create an owned HDF5 string type; fixed strings are null-padded like h5py.
 inline hid_t string_type(const StringSpec& spec) {
     ScopedId type(H5Tcopy(H5T_C_S1), H5Tclose);
@@ -440,8 +526,79 @@ inline hid_t string_type(const StringSpec& spec) {
 
 // Dispatch between datatypes and names
 
+// Reject composite types that require HDF5-managed variable-length allocations.
+inline bool contains_variable_storage(hid_t type) {
+    H5T_class_t kind = H5Tget_class(type);
+    if (kind == H5T_VLEN) return true;
+    if (kind == H5T_STRING) return H5Tis_variable_str(type) > 0;
+    if (kind == H5T_ARRAY || kind == H5T_ENUM) {
+        ScopedId base(H5Tget_super(type), H5Tclose);
+        return base.get() < 0 || contains_variable_storage(base.get());
+    }
+    if (kind == H5T_COMPOUND) {
+        int count = H5Tget_nmembers(type);
+        if (count < 0) return true;
+        for (int i = 0; i < count; ++i) {
+            ScopedId member(H5Tget_member_type(type, static_cast<unsigned>(i)), H5Tclose);
+            if (member.get() < 0 || contains_variable_storage(member.get())) return true;
+        }
+    }
+    return false;
+}
+
 // Return the dtype name for a supported HDF5 datatype, or an empty string.
-inline std::string dtype_name(hid_t type) {
+inline std::string dtype_name(hid_t type, bool nested = false) {
+    H5T_class_t type_class = H5Tget_class(type);
+    if (type_class == H5T_COMPOUND) {
+        std::string complex = complex_dtype(type);
+        if (!complex.empty()) return complex;
+    }
+    if (type_class == H5T_ARRAY && !nested) return {};
+    if (type_class == H5T_COMPOUND || type_class == H5T_ARRAY) {
+        if (contains_variable_storage(type)) return {};
+        if (type_class == H5T_COMPOUND) {
+            int count = H5Tget_nmembers(type);
+            size_t size = H5Tget_size(type);
+            if (count <= 0 || !size) return {};
+            std::string name = "compound:" + std::to_string(size) + ":";
+            for (int i = 0; i < count; ++i) {
+                char* raw_name = H5Tget_member_name(type, static_cast<unsigned>(i));
+                ScopedId member(H5Tget_member_type(type, static_cast<unsigned>(i)), H5Tclose);
+                if (!raw_name || member.get() < 0) {
+                    if (raw_name) H5free_memory(raw_name);
+                    return {};
+                }
+                std::string field_name(raw_name);
+                H5free_memory(raw_name);
+                std::string child_name = dtype_name(member.get(), true);
+                if (child_name.empty()) return {};
+                if (i) name.push_back(',');
+                name += std::to_string(H5Tget_member_offset(type, static_cast<unsigned>(i)));
+                name.push_back(':');
+                name += escape_name(field_name);
+                name.push_back(':');
+                name += escape_name(child_name);
+            }
+            return name;
+        }
+
+        int rank = H5Tget_array_ndims(type);
+        if (rank <= 0 || rank > H5S_MAX_RANK) return {};
+        hsize_t dims[H5S_MAX_RANK];
+        if (H5Tget_array_dims2(type, dims) < 0) return {};
+        ScopedId base(H5Tget_super(type), H5Tclose);
+        if (base.get() < 0) return {};
+        std::string child_name = dtype_name(base.get(), true);
+        if (child_name.empty()) return {};
+        std::string name = "array:" + std::to_string(rank) + ":";
+        for (int i = 0; i < rank; ++i) {
+            if (i) name.push_back(',');
+            name += std::to_string(dims[i]);
+        }
+        name.push_back(':');
+        name += escape_name(child_name);
+        return name;
+    }
     switch (H5Tget_class(type)) {
         case H5T_STRING: {
             // Name strings by variability, size, and character set.
@@ -474,6 +631,8 @@ inline std::string dtype_name(hid_t type) {
 
 // Create an owned file datatype from a supported dtype name, or return an invalid id.
 inline hid_t owned_type(const std::string& name) {
+    if (name.rfind("compound:", 0) == 0) return compound_type(name);
+    if (name.rfind("array:", 0) == 0) return array_type(name);
     StringSpec spec;
     if (parse_string_dtype(name, spec)) return string_type(spec);
     if (name.rfind("enum:", 0) == 0) return enum_type(name);

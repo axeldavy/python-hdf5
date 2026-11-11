@@ -101,7 +101,6 @@ def test_attribute_create_validation_preserves_existing(tmp_path: Path) -> None:
             {"shape": (2,)},
             {"shape": (-1,)},
             {"shape": (1,) * 33},
-            {"dtype": np.dtype([("field", "i4")])},
             {"dtype": np.dtype("i4", metadata={"unknown": True})},
         ):
             with pytest.raises((TypeError, ValueError)):
